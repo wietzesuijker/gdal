@@ -3099,6 +3099,50 @@ def test_vsiaz_access_token():
 
 
 ###############################################################################
+# Test CPL_AZURE_ENDPOINT_SUFFIX for sovereign clouds (e.g. Azure Government)
+
+
+def test_vsiaz_endpoint_suffix():
+
+    if gdaltest.webserver_port == 0:
+        pytest.skip()
+
+    gdal.VSICurlClearCache()
+
+    with gdaltest.config_options(
+        {
+            "AZURE_STORAGE_CONNECTION_STRING": None,
+            "AZURE_STORAGE_ACCOUNT": "myaccount",
+            "AZURE_STORAGE_ACCESS_KEY": "MY_ACCOUNT_KEY",
+            "CPL_AZURE_ENDPOINT": None,
+            "CPL_AZURE_ENDPOINT_SUFFIX": "core.usgovcloudapi.net",
+        },
+        thread_local=False,
+    ):
+        signed_url = gdal.GetSignedURL("/vsiaz/az_fake_bucket/resource")
+        assert "myaccount.blob.core.usgovcloudapi.net" in signed_url
+
+
+###############################################################################
+# Test EndpointSuffix in AZURE_STORAGE_CONNECTION_STRING
+
+
+def test_vsiaz_endpoint_suffix_in_connection_string():
+
+    gdal.VSICurlClearCache()
+
+    with gdaltest.config_options(
+        {
+            "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=MY_ACCOUNT_KEY;EndpointSuffix=core.usgovcloudapi.net",
+            "CPL_AZURE_ENDPOINT": None,
+        },
+        thread_local=False,
+    ):
+        signed_url = gdal.GetSignedURL("/vsiaz/az_fake_bucket/resource")
+        assert "myaccount.blob.core.usgovcloudapi.net" in signed_url
+
+
+###############################################################################
 # Test server-side copy from S3 to Azure
 
 

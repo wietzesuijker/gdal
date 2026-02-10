@@ -660,8 +660,13 @@ static bool GetConfigurationFromCLIConfigFile(
     }
 
     if (osEndpoint.empty())
+    {
+        const std::string osEndpointSuffix(VSIGetPathSpecificOption(
+            osPathForOption.c_str(), "CPL_AZURE_ENDPOINT_SUFFIX",
+            "core.windows.net"));
         osEndpoint = (bUseHTTPS ? "https://" : "http://") + osStorageAccount +
-                     "." + osServicePrefix + ".core.windows.net";
+                     "." + osServicePrefix + "." + osEndpointSuffix;
+    }
 
     osAccessToken = CPLGetConfigOption("AZURE_STORAGE_ACCESS_TOKEN", "");
     if (!osAccessToken.empty())
@@ -753,9 +758,14 @@ bool VSIAzureBlobHandleHelper::GetConfiguration(
         if (!osStorageAccount.empty())
         {
             if (osEndpoint.empty())
+            {
+                const std::string osEndpointSuffix(VSIGetPathSpecificOption(
+                    osPathForOption.c_str(), "CPL_AZURE_ENDPOINT_SUFFIX",
+                    "core.windows.net"));
                 osEndpoint = (bUseHTTPS ? "https://" : "http://") +
-                             osStorageAccount + "." + osServicePrefix +
-                             ".core.windows.net";
+                             osStorageAccount + "." + osServicePrefix + "." +
+                             osEndpointSuffix;
+            }
 
             osAccessToken = CSLFetchNameValueDef(
                 papszOptions, "AZURE_STORAGE_ACCESS_TOKEN",
