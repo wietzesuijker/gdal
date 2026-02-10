@@ -27,6 +27,10 @@ From GDAL 3.12 to GDAL 3.13
     :cpp:func:`GDALRasterBand::AdviseRead` and :cpp:func:`GDALRasterBand::GetVirtualMemAuto`
     now take a ``CSLConstList papszOptions`` parameter instead of ``char **``.
 
+- Setting the ``INIT_DEST`` warp option to ``NO_DATA`` without defining a
+  destination nodata value now results in a failure instead of a warning.
+  Use ``INIT_DEST=0`` (or another numeric value) if no nodata value is available.
+
 - Changes impacting C++ users:
 
   * :cpp:func:`GDALMajorObject::SetMetadata` now takes a ``CSLConstList`` argument
