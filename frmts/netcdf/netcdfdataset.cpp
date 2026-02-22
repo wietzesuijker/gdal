@@ -2614,6 +2614,30 @@ CPLErr netCDFRasterBand::IReadBlock(int nBlockXOff, int nBlockYOff,
                                nChunkLineSize);
                     }
                 }
+
+                // Apply Split&Swap in the bottom-up tiled path.
+                if (poGDS->nSplitAndSwapColumn > 0 &&
+                    nBlockXSize == nRasterXSize)
+                {
+                    const int nCol = poGDS->nSplitAndSwapColumn;
+                    const int nDTSize = GDALGetDataTypeSizeBytes(eDataType);
+                    const int nRight = nRasterXSize - nCol;
+                    std::vector<GByte> abyTmp(nChunkLineSize);
+                    for (size_t iLine = ystart; iLine <= yend; iLine++)
+                    {
+                        GByte *pabyLine =
+                            pabyImage + nChunkLineSize * (iLine - ystart);
+                        memcpy(abyTmp.data(), pabyLine, nChunkLineSize);
+                        memcpy(pabyLine,
+                               abyTmp.data() +
+                                   static_cast<size_t>(nCol) * nDTSize,
+                               static_cast<size_t>(nRight) * nDTSize);
+                        memcpy(pabyLine + static_cast<size_t>(nRight) * nDTSize,
+                               abyTmp.data(),
+                               static_cast<size_t>(nCol) * nDTSize);
+                    }
+                }
+
                 return CE_None;
             }
         }
@@ -2623,7 +2647,37 @@ CPLErr netCDFRasterBand::IReadBlock(int nBlockXOff, int nBlockYOff,
         }
     }
 
-    return FetchNetcdfChunk(xstart, ystart, pImage) ? CE_None : CE_Failure;
+    if (!FetchNetcdfChunk(xstart, ystart, pImage))
+        return CE_Failure;
+
+    // Apply Split&Swap for 0-360 -> -180..180 longitude rewrapping.
+    auto poGDS2 = cpl::down_cast<netCDFDataset *>(poDS);
+    if (poGDS2->nSplitAndSwapColumn > 0 && nBlockXSize == nRasterXSize)
+    {
+        const int nCol = poGDS2->nSplitAndSwapColumn;
+        const int nDTSize = GDALGetDataTypeSizeBytes(eDataType);
+        const int nRight = nRasterXSize - nCol;
+        const size_t nYLines =
+            std::min(static_cast<size_t>(nBlockYSize),
+                     static_cast<size_t>(nRasterYSize) -
+                         static_cast<size_t>(nBlockYOff) * nBlockYSize);
+        std::vector<GByte> abyTmp(static_cast<size_t>(nRasterXSize) * nDTSize);
+        GByte *pabyImage = static_cast<GByte *>(pImage);
+        for (size_t iLine = 0; iLine < nYLines; iLine++)
+        {
+            GByte *pabyLine =
+                pabyImage + iLine * static_cast<size_t>(nBlockXSize) * nDTSize;
+            memcpy(abyTmp.data(), pabyLine,
+                   static_cast<size_t>(nRasterXSize) * nDTSize);
+            memcpy(pabyLine,
+                   abyTmp.data() + static_cast<size_t>(nCol) * nDTSize,
+                   static_cast<size_t>(nRight) * nDTSize);
+            memcpy(pabyLine + static_cast<size_t>(nRight) * nDTSize,
+                   abyTmp.data(), static_cast<size_t>(nCol) * nDTSize);
+        }
+    }
+
+    return CE_None;
 }
 
 /************************************************************************/
@@ -4035,6 +4089,38 @@ void netCDFDataset::SetProjectionFromVar(
                             yMinMax[0] = yMinMax[0] * satelliteHeight;
                             yMinMax[1] = yMinMax[1] * satelliteHeight;
                         }
+                    }
+                }
+            }
+
+            // Split&Swap: rewrap 0-360 longitude to -180..180 by
+            // reordering pixels around the antimeridian.
+            if (!bSwitchedXY &&
+                NCDFIsVarLongitude(nGroupDimXID, nVarDimXID, nullptr) &&
+                CPLTestBool(CPLGetConfigOption(
+                    "GDAL_NETCDF_ADJUST_LONGITUDE_RANGE", "YES")))
+            {
+                const double dfPixelSize =
+                    (xMinMax[1] - xMinMax[0]) /
+                    (poDS->nRasterXSize + (node_offset - 1));
+                if (dfPixelSize > 0 &&
+                    fabs(360.0 - dfPixelSize * poDS->nRasterXSize) <
+                        dfPixelSize / 4 &&
+                    xMinMax[0] >= 0 && xMinMax[0] <= 180)
+                {
+                    const int nCol = static_cast<int>(
+                        ceil((180.0 - xMinMax[0]) / dfPixelSize));
+                    if (nCol > 0 && nCol < poDS->nRasterXSize)
+                    {
+                        poDS->nSplitAndSwapColumn = nCol;
+                        xMinMax[0] = -180;
+                        xMinMax[1] =
+                            xMinMax[0] + dfPixelSize * (poDS->nRasterXSize +
+                                                        (node_offset - 1));
+                        CPLDebug("GDAL_netCDF",
+                                 "Rewrapping around the antimeridian "
+                                 "at column %d",
+                                 nCol);
                     }
                 }
             }

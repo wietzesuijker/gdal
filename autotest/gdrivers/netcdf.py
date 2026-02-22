@@ -6968,3 +6968,46 @@ def test_netcdf_write_non_axis_aligned_geotransform(
         )
     assert warped_ds.GetGeoTransform() == pytest.approx(expected_warp_gt)
     assert warped_ds.GetRasterBand(1).Checksum() == expected_warp_cs
+
+
+###############################################################################
+# Test Split&Swap: 0-360 longitude rewrapped to -180..180
+
+
+def test_netcdf_split_and_swap():
+    """Verify that a 0-360 netCDF dataset is rewrapped to -180..180."""
+
+    ds = gdal.Open("data/netcdf/lon_0_360.nc")
+    assert ds is not None
+    gt = ds.GetGeoTransform()
+
+    # 36 pixels, 10-degree spacing, pixel centers at -180..170
+    assert gt[0] == pytest.approx(-185.0)
+    assert gt[1] == pytest.approx(10.0)
+
+    band = ds.GetRasterBand(1)
+    import struct
+
+    data = band.ReadRaster(0, 0, ds.RasterXSize, 1)
+    vals = list(struct.unpack(f"{ds.RasterXSize}f", data))
+    expected = list(range(180, 360, 10)) + list(range(0, 180, 10))
+    assert [int(v) for v in vals] == expected
+
+
+def test_netcdf_split_and_swap_disabled():
+    """Verify GDAL_NETCDF_ADJUST_LONGITUDE_RANGE=NO keeps 0-360 order."""
+
+    with gdal.config_option("GDAL_NETCDF_ADJUST_LONGITUDE_RANGE", "NO"):
+        ds = gdal.Open("data/netcdf/lon_0_360.nc")
+        assert ds is not None
+        gt = ds.GetGeoTransform()
+
+        # Should remain 0-360 (pixel center 0, origin -5)
+        assert gt[0] == pytest.approx(-5.0)
+
+        band = ds.GetRasterBand(1)
+        import struct
+
+        data = band.ReadRaster(0, 0, ds.RasterXSize, 1)
+        vals = list(struct.unpack(f"{ds.RasterXSize}f", data))
+        assert [int(v) for v in vals] == list(range(0, 360, 10))

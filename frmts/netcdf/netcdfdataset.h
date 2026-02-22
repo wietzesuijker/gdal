@@ -394,6 +394,10 @@ class netCDFDataset final : public GDALPamDataset
     bool bIsGeographic;
     bool bSwitchedXY = false;
 
+    // Split&Swap: rewrap 0-360 lon to -180..180 by moving pixels east of
+    // nSplitAndSwapColumn to the beginning.  0 = disabled.
+    int nSplitAndSwapColumn = 0;
+
     /* state vars */
     bool bDefineMode;
     bool m_bHasProjection = false;
