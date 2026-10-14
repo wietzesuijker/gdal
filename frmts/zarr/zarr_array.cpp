@@ -12,6 +12,7 @@
 
 #include "zarr.h"
 
+#include "cpl_error_internal.h"
 #include "cpl_float.h"
 #include "cpl_mem_cache.h"
 #include "cpl_multiproc.h"
@@ -974,6 +975,17 @@ bool ZarrArray::IsAdviseReadCached(const GUInt64 *arrayStartIdx,
     return true;
 }
 
+void ZarrReplayErrors(CPLErrorAccumulator &oErrorAccumulator)
+{
+    oErrorAccumulator.ReplayErrors();
+    // A warning emitted after a failure must not hide it from the caller.
+    for (const auto &oError : oErrorAccumulator.GetErrors())
+    {
+        if (oError.type == CE_Failure)
+            CPLErrorSetState(oError.type, oError.no, oError.msg.c_str());
+    }
+}
+
 /************************************************************************/
 /*                    ZarrArray::IAdviseReadCommon()                    */
 /************************************************************************/
@@ -1208,11 +1220,12 @@ bool ZarrArray::IRead(const GUInt64 *arrayStartIdx, const size_t *count,
         bufferStride = bufferStrideMod.data();
     }
 
-    // Auto-parallel: prefetch multi-chunk reads via IAdviseRead().
-    // arrayStep[i] guaranteed positive after negative-step normalization above.
+    // Auto-parallel: prefetch contiguous multi-chunk reads via IAdviseRead().
+    // A strided read must not prefetch corrupt chunks it does not request.
     // Skip if the current read region is already covered by a previous
     // IAdviseRead (explicit or auto), so we don't blow away a useful cache.
-    if (nDims >= 2)
+    if (nDims >= 2 && std::all_of(arrayStep, arrayStep + nDims,
+                                  [](GInt64 nStep) { return nStep == 1; }))
     {
         if (!IsAdviseReadCached(arrayStartIdx, count, arrayStep))
         {
@@ -1226,29 +1239,17 @@ bool ZarrArray::IRead(const GUInt64 *arrayStartIdx, const size_t *count,
                     const uint64_t startBlock =
                         arrayStartIdx[i] / m_anInnerBlockSize[i];
                     const uint64_t endBlock =
-                        (arrayStartIdx[i] +
-                         (count[i] - 1) * static_cast<uint64_t>(arrayStep[i])) /
+                        (arrayStartIdx[i] + count[i] - 1) /
                         m_anInnerBlockSize[i];
                     nReqChunks *=
                         static_cast<size_t>(endBlock - startBlock + 1);
                 }
                 if (nReqChunks > 1)
                 {
-                    // IAdviseRead expects the contiguous element count per
-                    // dimension, not the strided output count.  When step > 1,
-                    // expand count to cover the full element range.
-                    std::vector<size_t> anAdjustedCount(nDims);
-                    for (size_t i = 0; i < nDims; ++i)
-                    {
-                        anAdjustedCount[i] =
-                            1 +
-                            (count[i] - 1) * static_cast<size_t>(arrayStep[i]);
-                    }
                     CPLStringList aosOptions;
                     aosOptions.SetNameValue("NUM_THREADS", pszNumThreads);
-                    CPL_IGNORE_RET_VAL(IAdviseRead(arrayStartIdx,
-                                                   anAdjustedCount.data(),
-                                                   aosOptions.List()));
+                    CPL_IGNORE_RET_VAL(
+                        IAdviseRead(arrayStartIdx, count, aosOptions.List()));
                 }
             }
         }

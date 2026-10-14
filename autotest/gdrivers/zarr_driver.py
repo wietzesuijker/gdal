@@ -4303,8 +4303,8 @@ def test_zarr_iread_auto_parallel(tmp_path, format):
         # Full read
         assert ar.Read() == expected_full
 
-        # Strided read (step > 1): verifies adjusted count passed to
-        # IAdviseRead covers the full element range, not just count elements.
+        # Strided reads visit their requested chunks without prefetching
+        # chunks in the gaps.
         assert (
             ar.Read(
                 array_start_idx=[0, 0],
@@ -4434,35 +4434,201 @@ def test_zarr_advise_read_cache_preserved(tmp_path, format):
 
 
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
-def test_zarr_advise_read_corrupted_chunk_multithreaded(tmp_vsimem, format):
-    """IAdviseRead returns an error instead of hanging when a chunk fails to
-    load while other threads still have chunks to process."""
+@pytest.mark.parametrize(
+    "use_exceptions,warning_after_error", [(False, False), (True, False), (False, True)]
+)
+def test_zarr_advise_read_corrupted_chunk_multithreaded(
+    tmp_vsimem, format, use_exceptions, warning_after_error
+):
+    """Worker errors reach the caller without hanging or caching a failed
+    prefetch, and a repaired chunk can be prefetched successfully."""
 
     filename = tmp_vsimem / "test.zarr"
 
-    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
         filename, options=["FORMAT=" + format]
-    )
-    rg = ds.GetRootGroup()
-    dim_y = rg.CreateDimension("Y", None, None, 256)
-    dim_x = rg.CreateDimension("X", None, None, 256)
-    ar = rg.CreateMDArray(
-        "test",
-        [dim_y, dim_x],
-        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
-        ["BLOCKSIZE=16,16"],
-    )
-    ar.Write(array.array("B", [(i % 256) for i in range(256 * 256)]))
-    ds = None
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dim_y = rg.CreateDimension("Y", None, None, 256)
+        dim_x = rg.CreateDimension("X", None, None, 256)
+        ar = rg.CreateMDArray(
+            "test",
+            [dim_y, dim_x],
+            gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+            ["BLOCKSIZE=16,16"],
+        )
+        expected = array.array("B", [(i % 256) for i in range(256 * 256)])
+        ar.Write(expected)
+        ar = rg = dim_y = dim_x = None
 
     chunk = filename / "test" / ("0.0" if format == "ZARR_V2" else "c/0/0")
     assert gdal.VSIStatL(chunk) is not None
+    with gdal.VSIFile(chunk, "rb") as f:
+        chunk_data = f.read()
     gdal.FileFromMemBuffer(chunk, b"corrupted")
 
-    ds = gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER)
-    ar = ds.GetRootGroup().OpenMDArray("test")
-    with gdal.quiet_errors():
-        assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("test")
+        with gdal.ExceptionMgr(useExceptions=use_exceptions):
+            for _ in range(2):
+                gdal.ErrorReset()
+                if use_exceptions:
+                    with pytest.raises(RuntimeError, match="has not expected size"):
+                        ar.AdviseRead(options=["NUM_THREADS=4"])
+                elif warning_after_error:
+                    errors = []
+
+                    def handler(level, number, message):
+                        errors.append((level, number, message))
+                        if level == gdal.CE_Failure:
+                            gdal.Error(gdal.CE_Warning, gdal.CPLE_AppDefined, "warning")
+
+                    with gdaltest.error_handler(handler):
+                        assert (
+                            ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+                        )
+                    assert errors == [
+                        (gdal.CE_Failure, gdal.CPLE_AppDefined, gdal.GetLastErrorMsg()),
+                        (gdal.CE_Warning, gdal.CPLE_AppDefined, "warning"),
+                    ]
+                else:
+                    with gdaltest.error_raised(gdal.CE_Failure, match=str(chunk)):
+                        assert (
+                            ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+                        )
+                assert gdal.GetLastErrorType() == gdal.CE_Failure
+                assert gdal.GetLastErrorNo() == gdal.CPLE_AppDefined
+                assert "has not expected size" in gdal.GetLastErrorMsg()
+                assert str(chunk) in gdal.GetLastErrorMsg()
+
+            gdal.FileFromMemBuffer(chunk, chunk_data)
+            assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_None
+            gdal.Unlink(chunk)
+            assert ar.Read() == expected.tobytes()
+        ar = None
+
+
+@pytest.mark.parametrize("num_threads", [1, 2])
+@pytest.mark.parametrize("use_exceptions", [False, True])
+@pytest.mark.parametrize("corruption", ["missing", "index", "chunk"])
+def test_zarr_advise_read_sharded_failure(
+    tmp_vsimem, num_threads, use_exceptions, corruption
+):
+    if "zstd" not in gdal.GetDriverByName("ZARR").GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_vsimem / "test.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("Y", 4), ("X", 4)],
+        [2, 2],
+        [1, 1],
+        gdal.GDT_UInt8,
+        ["COMPRESS=ZSTD"],
+    )
+    expected = bytearray(range(1, 17))
+    ar.SetNoDataValueDouble(0)
+    assert ar.Write(expected) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    shard = filename / "data/c/0/0"
+    with gdal.VSIFile(shard, "rb") as f:
+        shard_data = f.read()
+    if corruption == "missing":
+        gdal.Unlink(shard)
+        for i in (0, 1, 4, 5):
+            expected[i] = 0
+    else:
+        gdal.FileFromMemBuffer(
+            shard, b"bad" if corruption == "index" else b"bad" + shard_data[3:]
+        )
+
+    message = (
+        "shard file too small"
+        if corruption == "index"
+        else "Error while retrieving decompressed size of ZSTD frame"
+    )
+    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            with gdal.ExceptionMgr(useExceptions=use_exceptions):
+                for _ in range(2):
+                    gdal.ErrorReset()
+                    if corruption == "missing":
+                        assert ar.AdviseRead() == gdal.CE_None
+                    elif use_exceptions:
+                        with pytest.raises(RuntimeError, match=message):
+                            ar.AdviseRead()
+                    else:
+                        with gdaltest.error_raised(gdal.CE_Failure, match=message):
+                            assert ar.AdviseRead() == gdal.CE_Failure
+                    if corruption != "missing":
+                        assert gdal.GetLastErrorType() == gdal.CE_Failure
+                        assert gdal.GetLastErrorNo() == gdal.CPLE_AppDefined
+
+                if corruption != "missing":
+                    gdal.FileFromMemBuffer(shard, shard_data)
+                    assert ar.AdviseRead() == gdal.CE_None
+                for y in range(2):
+                    for x in range(2):
+                        shard_path = filename / f"data/c/{y}/{x}"
+                        if gdal.VSIStatL(shard_path) is not None:
+                            assert gdal.Unlink(shard_path) == 0
+                assert ar.Read() == expected
+            ar = None
+
+
+@pytest.mark.parametrize(
+    "format,sharded", [("ZARR_V2", False), ("ZARR_V3", False), ("ZARR_V3", True)]
+)
+@pytest.mark.parametrize("step", [3, -3])
+@pytest.mark.parametrize("num_threads", [None, "2"])
+@gdaltest.enable_exceptions()
+def test_zarr_strided_read_skips_corrupt_chunks(
+    tmp_vsimem, format, sharded, step, num_threads
+):
+    filename = tmp_vsimem / "test.zarr"
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dims = [rg.CreateDimension(n, None, None, s) for n, s in [("Y", 2), ("X", 6)]]
+        options = (
+            ["BLOCKSIZE=1,3", "SHARD_CHUNK_SHAPE=1,1", "COMPRESS=GZIP"]
+            if sharded
+            else ["BLOCKSIZE=1,1"]
+        )
+        ar = rg.CreateMDArray(
+            "data", dims, gdal.ExtendedDataType.Create(gdal.GDT_UInt8), options
+        )
+        ar.SetNoDataValueDouble(255)
+        assert ar.Write(bytes(range(1, 13))) == gdal.CE_None
+        ar = rg = dims = None
+
+    if sharded:
+        shard = filename / "data/c/0/0"
+        with gdal.VSIFile(shard, "rb") as f:
+            data = bytearray(f.read())
+        offset, size = struct.unpack_from("<QQ", data, len(data) - 52 + 16)
+        data[offset : offset + size] = b"X" * size
+        gdal.FileFromMemBuffer(shard, data)
+    else:
+        chunk = filename / "data" / ("0.1" if format == "ZARR_V2" else "c/0/1")
+        gdal.FileFromMemBuffer(chunk, b"")
+
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            gdal.ErrorReset()
+            with gdaltest.error_raised(gdal.CE_None):
+                assert ar.Read(
+                    array_start_idx=[0, 0 if step > 0 else 3],
+                    count=[1, 2],
+                    array_step=[1, step],
+                ) == (bytes([1, 4]) if step > 0 else bytes([4, 1]))
+            assert gdal.GetLastErrorType() == gdal.CE_None
+            ar = None
 
 
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
@@ -6651,8 +6817,8 @@ def test_zarr_read_simple_sharding_read_errors(tmp_vsimem):
             except Exception as e:
                 error_msgs += str(e) + "\n"
 
-    assert "DecodePartial(): cannot decode chunk 0" in error_msgs
-    assert "cannot decode chunk" in error_msgs
+    assert "Error while retrieving decompressed size of ZSTD frame" in error_msgs
+    assert "BatchDecodePartial: cannot decode chunk" in error_msgs
 
 
 ###############################################################################
