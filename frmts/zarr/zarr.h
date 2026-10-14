@@ -164,6 +164,7 @@ class ZarrRasterBand final : public GDALRasterBand
     double GetNoDataValue(int *pbHasNoData) override;
     int64_t GetNoDataValueAsInt64(int *pbHasNoData) override;
     uint64_t GetNoDataValueAsUInt64(int *pbHasNoData) override;
+    CPLErr DeleteNoDataValue() override;
     CPLErr SetNoDataValue(double dfNoData) override;
     CPLErr SetNoDataValueAsInt64(int64_t nNoData) override;
     CPLErr SetNoDataValueAsUInt64(uint64_t nNoData) override;
@@ -1028,7 +1029,15 @@ class ZarrArray CPL_NON_FINAL : public GDALPamMDArray
 
     virtual bool AllocateWorkingBuffers() const = 0;
 
-    void SerializeNumericNoData(CPLJSONObject &oRoot) const;
+    void SerializeNumericNoData(CPLJSONObject &oRoot,
+                                const void *pRawNoData) const;
+
+    virtual const GByte *GetRawFillValue() const
+    {
+        return m_pabyNoData;
+    }
+
+    double GetFillValueAsDouble() const;
 
     void DeallocateDecodedBlockData();
 
@@ -1395,6 +1404,9 @@ class ZarrV3CodecSequence;
 
 class ZarrV3Array final : public ZarrArray
 {
+    // Storage fill is independent of the optional CF _FillValue (nodata).
+    std::vector<GByte> m_abyFillValue{};
+    bool m_bNoDataFromFillValue = false;
     bool m_bV2ChunkKeyEncoding = false;
     std::unique_ptr<ZarrV3CodecSequence> m_poCodecs{};
     CPLJSONArray m_oJSONCodecs{};
@@ -1478,6 +1490,22 @@ class ZarrV3Array final : public ZarrArray
            const std::vector<GUInt64> &anOuterBlockSize,
            const std::vector<GUInt64> &anInnerBlockSize);
 
+    std::shared_ptr<GDALAttribute>
+    CreateAttribute(const std::string &osName,
+                    const std::vector<GUInt64> &anDimensions,
+                    const GDALExtendedDataType &oDataType,
+                    CSLConstList papszOptions = nullptr) override;
+
+    void RegisterFillValue(const void *pRawFillValue);
+
+    void RegisterNoDataFromFillValue(const void *pRawFillValue)
+    {
+        RegisterNoDataValue(pRawFillValue);
+        m_bNoDataFromFillValue = true;
+    }
+
+    bool SetRawNoDataValue(const void *pRawNoData) override;
+
     void SetIsV2ChunkKeyEncoding(bool b)
     {
         m_bV2ChunkKeyEncoding = b;
@@ -1511,6 +1539,11 @@ class ZarrV3Array final : public ZarrArray
                                  const size_t nDTSize);
 
   protected:
+    const GByte *GetRawFillValue() const override
+    {
+        return m_abyFillValue.data();
+    }
+
     std::string GetDataDirectory() const override;
 
     CPLStringList

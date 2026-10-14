@@ -2081,25 +2081,7 @@ def test_zarr_create_array(tmp_vsimem, datatype, nodata, format):
                 got_nodata = ar.GetNoDataValueAsRaw()
                 assert got_nodata == nodata
         else:
-            if format == "ZARR_V3":
-                # fill_value is mandatory in V3: the default value of the data
-                # type is written and reported as nodata
-                if datatype.GetClass() == gdal.GEDTC_NUMERIC:
-                    got_nodata = ar.GetNoDataValueAsDouble()
-                    if datatype.GetNumericDataType() in (
-                        gdal.GDT_Float16,
-                        gdal.GDT_Float32,
-                        gdal.GDT_Float64,
-                    ):
-                        assert math.isnan(got_nodata)
-                    else:
-                        assert got_nodata == 0
-                elif datatype.GetClass() == gdal.GEDTC_STRING:
-                    assert ar.GetNoDataValueAsString() == ""
-                else:
-                    assert ar.GetNoDataValueAsRaw() is None
-            else:
-                assert ar.GetNoDataValueAsRaw() is None
+            assert ar.GetNoDataValueAsRaw() is None
 
 
 @pytest.mark.parametrize(
@@ -2153,14 +2135,14 @@ def test_zarr_v3_create_array_without_nodata_fill_value(
         ar = ds.GetRootGroup().OpenMDArray("my_ar")
         assert ar
         assert gdal.GetLastErrorType() == gdal.CE_None, gdal.GetLastErrorMsg()
-        # The default fill_value is reported as nodata on reopen, as for any
-        # Zarr array with a fill_value (already the case of NaN for floats)
+        assert ar.GetNoDataValueAsRaw() is None
+        values = ar.Read()
         if datatype.GetClass() == gdal.GEDTC_STRING:
-            assert ar.GetNoDataValueAsString() == ""
+            assert values == ["", ""]
         elif expected_fill_value == "NaN":
-            assert math.isnan(ar.GetNoDataValueAsDouble())
+            assert all(math.isnan(v) for v in ar.ReadAsArray())
         else:
-            assert ar.GetNoDataValueAsRaw() == bytes(datatype.GetSize())
+            assert values == bytes(2 * datatype.GetSize())
 
 
 @pytest.mark.parametrize("fill_value", [False, True])
@@ -2184,7 +2166,10 @@ def test_zarr_v3_update_bool_fill_value(tmp_vsimem, fill_value, operation):
     with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
         rg = ds.GetRootGroup()
         ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
-        assert ar.GetNoDataValueAsDouble() == int(fill_value)
+        assert ar.GetNoDataValueAsRaw() is None
+        with gdal.quiet_errors():
+            assert ar.SetNoDataValueDouble(2) == gdal.CE_Failure
+        assert ar.GetNoDataValueAsRaw() is None
         if operation == "delete_nodata":
             assert ar.DeleteNoDataValue() == gdal.CE_None
         elif operation == "set_nodata":
@@ -2192,23 +2177,36 @@ def test_zarr_v3_update_bool_fill_value(tmp_vsimem, fill_value, operation):
         else:
             assert ar.SetUnit("m") == gdal.CE_None
 
-    expected_fill_value = False if operation == "delete_nodata" else fill_value
+    expected_fill_value = fill_value
     with gdal.VSIFile(filename / "zarr.json", "rb") as f:
         assert json.loads(f.read())["fill_value"] is expected_fill_value
 
     with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
         rg = ds.GetRootGroup()
         ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
-        assert ar.GetNoDataValueAsDouble() == int(expected_fill_value)
+        assert ar.GetNoDataValueAsDouble() == (
+            int(fill_value) if operation == "set_nodata" else None
+        )
         assert ar.Read() == bytes([int(expected_fill_value)] * 2)
 
 
-def test_zarr_v3_create_classic_without_nodata_fill_value(tmp_vsimem):
+@pytest.mark.parametrize(
+    "datatype,nodata",
+    [(gdal.GDT_Int16, -9999), (gdal.GDT_Int64, -(2**63)), (gdal.GDT_UInt64, 2**64 - 1)],
+)
+@pytest.mark.parametrize("nbands", [1, 2])
+def test_zarr_v3_create_classic_without_nodata_fill_value(
+    tmp_vsimem, datatype, nodata, nbands
+):
 
     with gdal.GetDriverByName("ZARR").Create(
-        tmp_vsimem / "test.zarr", 3, 2, 1, gdal.GDT_Int16, options=["FORMAT=ZARR_V3"]
-    ):
-        pass
+        tmp_vsimem / "test.zarr", 3, 2, nbands, datatype, options=["FORMAT=ZARR_V3"]
+    ) as ds:
+        for idx in range(1, nbands + 1):
+            band = ds.GetRasterBand(idx)
+            assert band.SetNoDataValue(nodata) == gdal.CE_None
+            assert band.DeleteNoDataValue() == gdal.CE_None
+            assert band.GetNoDataValue() is None
 
     with gdal.VSIFile(tmp_vsimem / "test.zarr" / "test" / "zarr.json", "rb") as f:
         assert json.loads(f.read())["fill_value"] == 0
@@ -2216,7 +2214,364 @@ def test_zarr_v3_create_classic_without_nodata_fill_value(tmp_vsimem):
     gdal.ErrorReset()
     with gdal.Open(tmp_vsimem / "test.zarr") as ds:
         assert gdal.GetLastErrorType() == gdal.CE_None, gdal.GetLastErrorMsg()
-        assert ds.GetRasterBand(1).GetNoDataValue() == 0
+        assert ds.GetRasterBand(1).GetNoDataValue() is None
+        assert ds.GetRasterBand(1).GetMaskBand().ReadRaster() == bytes([255] * 6)
+
+    with gdal.Open(tmp_vsimem / "test.zarr", gdal.GA_Update) as ds:
+        band = ds.GetRasterBand(1)
+        assert band.SetNoDataValue(0) == gdal.CE_None
+        assert band.GetNoDataValue() == 0
+        assert band.GetMaskBand().ReadRaster() == bytes(6)
+        assert band.SetNoDataValue(nodata) == gdal.CE_None
+        assert band.GetNoDataValue() == nodata
+        assert band.GetMaskBand().ReadRaster() == bytes([255] * 6)
+    with gdal.Open(tmp_vsimem / "test.zarr") as ds:
+        assert ds.GetRasterBand(1).GetNoDataValue() == nodata
+        assert ds.ReadRaster() == bytes(
+            6 * nbands * gdal.GetDataTypeSize(datatype) // 8
+        )
+        with gdal.quiet_errors():
+            assert ds.GetRasterBand(1).SetNoDataValue(0) == gdal.CE_Failure
+    with gdal.Open(tmp_vsimem / "test.zarr", gdal.GA_Update) as ds:
+        assert ds.GetRasterBand(1).DeleteNoDataValue() == gdal.CE_None
+    with gdal.Open(tmp_vsimem / "test.zarr") as ds:
+        assert ds.GetRasterBand(1).GetNoDataValue() is None
+        assert ds.GetRasterBand(1).GetMaskBand().ReadRaster() == bytes([255] * 6)
+
+
+def test_zarr_v3_fill_value_reserved_attribute(tmp_vsimem):
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        tmp_vsimem / "test.zarr", options=["FORMAT=ZARR_V3"]
+    ) as ds:
+        ar = ds.GetRootGroup().CreateMDArray(
+            "ar", [], gdal.ExtendedDataType.Create(gdal.GDT_Int16)
+        )
+        with gdal.quiet_errors():
+            assert (
+                ar.CreateAttribute(
+                    "_FillValue", [], gdal.ExtendedDataType.Create(gdal.GDT_Int16)
+                )
+                is None
+            )
+        assert "Use the nodata setter" in gdal.GetLastErrorMsg()
+        assert ar.SetNoDataValueDouble(-7) == gdal.CE_None
+    with gdal.OpenEx(tmp_vsimem / "test.zarr", gdal.OF_MULTIDIM_RASTER) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("ar")
+        assert ar.GetNoDataValueAsDouble() == -7
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_zarr_v3_storage_fill_independent_of_nodata(tmp_path, sharded):
+    filename = tmp_path / "test.zarr"
+    options = ["FORMAT=ZARR_V3"]
+    array_options = ["BLOCKSIZE=4"]
+    if sharded:
+        array_options.append("SHARD_CHUNK_SHAPE=2")
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=options
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dim = rg.CreateDimension("x", None, None, 8)
+        ar = rg.CreateMDArray(
+            "ar", [dim], gdal.ExtendedDataType.Create(gdal.GDT_Int16), array_options
+        )
+        assert ar.SetNoDataValueDouble(-9999) == gdal.CE_None
+        assert ar.ReadAsArray().tolist() == [0] * 8
+        # Partial writes initialize the rest of the chunk/shard from storage fill.
+        assert (
+            ar.Write(array.array("h", [-9999, 0]), array_start_idx=[0], count=[2])
+            == gdal.CE_None
+        )
+    for nodata in (-9999, 0, None):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("ar")
+            if nodata is None:
+                assert ar.DeleteNoDataValue() == gdal.CE_None
+            else:
+                assert ar.SetNoDataValueDouble(nodata) == gdal.CE_None
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("ar")
+            assert ar.GetNoDataValueAsDouble() == nodata
+            assert ar.ReadAsArray().tolist() == [-9999] + [0] * 7
+        j = json.loads((filename / "ar" / "zarr.json").read_text())
+        assert j["fill_value"] == 0
+        if nodata is None:
+            assert "_FillValue" not in j["attributes"]
+        else:
+            assert j["attributes"]["_FillValue"] == nodata
+    # Growing the array must also return storage fill, including unwritten shards.
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("ar")
+        assert ar.Resize([12]) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("ar")
+        assert ar.GetNoDataValueAsRaw() is None
+        assert ar.ReadAsArray().tolist() == [-9999] + [0] * 11
+
+
+@pytest.mark.parametrize(
+    "data_type,fill_value,nodata,expected_raw",
+    [
+        ("bool", True, False, bytes([0])),
+        ("uint8", 0, 255, struct.pack("B", 255)),
+        ("int16", 0, -9999, struct.pack("h", -9999)),
+        ("int64", 0, -(2**63), struct.pack("q", -(2**63))),
+        ("int64", 0, 2**63 - 1, struct.pack("q", 2**63 - 1)),
+        ("uint64", 0, 2**64 - 1, struct.pack("Q", 2**64 - 1)),
+        (
+            "float32",
+            "NaN",
+            base64.b64encode(struct.pack("<d", -9999)).decode(),
+            struct.pack("f", -9999),
+        ),
+        (
+            "float64",
+            0,
+            base64.b64encode(struct.pack("<d", float("inf"))).decode(),
+            struct.pack("d", float("inf")),
+        ),
+        (
+            "complex64",
+            [0, 2],
+            [base64.b64encode(struct.pack("<d", v)).decode() for v in (3, 4)],
+            struct.pack("ff", 3, 4),
+        ),
+        ("string", "", "missing", "missing"),
+    ],
+)
+def test_zarr_v3_cf_fill_value(tmp_vsimem, data_type, fill_value, nodata, expected_raw):
+    filename = tmp_vsimem / "test.zarr"
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": (
+            [{"name": "vlen-utf8"}]
+            if data_type == "string"
+            else [{"name": "bytes", "configuration": {"endian": "little"}}]
+        ),
+        "attributes": {"_FillValue": nodata, "description": "keep me"},
+    }
+    gdal.Mkdir(filename, 0)
+    gdal.FileFromMemBuffer(filename / "zarr.json", json.dumps(metadata))
+    # Explicit metadata is authoritative even with the legacy option enabled.
+    for open_options in ([], ["USE_FILL_VALUE_AS_NODATA=YES"]):
+        with gdal.OpenEx(
+            filename,
+            gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE,
+            open_options=open_options,
+        ) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            if data_type == "string":
+                assert ar.GetNoDataValueAsString() == expected_raw
+                assert ar.Read() == ["", ""]
+                assert ar.SetNoDataValueString("changed") == gdal.CE_None
+                assert ar.SetNoDataValueString(expected_raw) == gdal.CE_None
+            else:
+                assert ar.GetNoDataValueAsRaw() == expected_raw
+                assert ar.SetNoDataValueRaw(expected_raw) == gdal.CE_None
+                if data_type == "complex64":
+                    # A zero real component must not cause nonzero imaginary fill to be skipped.
+                    assert ar.Read() == (
+                        struct.pack("ffff", 0, 2, 0, 2)
+                        if not open_options
+                        else bytes(16)
+                    )
+                    assert ar.Write(struct.pack("ffff", 0, 0, 0, 0)) == gdal.CE_None
+                    assert ar.Read() == bytes(16)
+            assert ar.GetAttribute("description").ReadAsString() == "keep me"
+        with gdal.VSIFile(filename / "zarr.json", "rb") as f:
+            j = json.loads(f.read())
+        assert j["fill_value"] == fill_value
+        assert j["attributes"]["_FillValue"] == nodata
+        assert j["attributes"]["description"] == "keep me"
+    # Removing nodata leaves storage fill untouched, including strings and complex.
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.DeleteNoDataValue() == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.GetNoDataValueAsRaw() is None
+
+
+@pytest.mark.parametrize(
+    "data_type,nodata",
+    [
+        ("int8", 128),
+        ("uint8", -1),
+        ("int16", 1.5),
+        ("int64", 2**63),
+        ("uint64", -1),
+        ("bool", 1),
+        ("float32", "not base64"),
+        ("float64", "AAA="),
+        ("complex64", [0]),
+        ("complex64", ["bad", "bad"]),
+        ("string", 1),
+        ("uint8", None),
+    ],
+)
+def test_zarr_v3_invalid_cf_fill_value(tmp_vsimem, data_type, nodata):
+    filename = tmp_vsimem / "test.zarr"
+    j = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": (
+            [0, 0]
+            if data_type == "complex64"
+            else (
+                False if data_type == "bool" else ("" if data_type == "string" else 0)
+            )
+        ),
+        "codecs": (
+            [{"name": "vlen-utf8"}]
+            if data_type == "string"
+            else [{"name": "bytes", "configuration": {"endian": "little"}}]
+        ),
+        "attributes": {"_FillValue": nodata},
+    }
+    gdal.Mkdir(filename, 0)
+    gdal.FileFromMemBuffer(filename / "zarr.json", json.dumps(j))
+    with gdal.quiet_errors():
+        ds = gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER)
+        if ds:
+            rg = ds.GetRootGroup()
+            assert rg.OpenMDArray(rg.GetMDArrayNames()[0]) is None
+    assert "Invalid _FillValue" in gdal.GetLastErrorMsg()
+
+
+@pytest.mark.parametrize(
+    "datatype,fill_value,code,value",
+    [
+        ("int64", 2**53 + 1, "q", 2**53),
+        ("uint64", 2**53 + 1, "Q", 2**53),
+        ("float32", -0.0, "f", 0.0),
+        ("float64", -0.0, "d", 0.0),
+    ],
+)
+def test_zarr_v3_non_fill_chunk_preserves_exact_values(
+    tmp_path, datatype, fill_value, code, value
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    j = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": datatype,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+    }
+    (filename / "zarr.json").write_text(json.dumps(j))
+    expected = struct.pack(code * 2, value, value)
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Write(expected) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.GetNoDataValueAsRaw() is None
+        assert ar.Read() == expected
+
+
+@pytest.mark.parametrize("fill_value", ["", "missing"])
+def test_zarr_v3_string_partial_write_preserves_fill(tmp_path, fill_value):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    j = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [4],
+        "data_type": "string",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": [{"name": "vlen-utf8"}],
+    }
+    (filename / "zarr.json").write_text(json.dumps(j))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Write(["written"], array_start_idx=[0], count=[1]) == gdal.CE_None
+        assert ar.Read() == ["written"] + [fill_value] * 3
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == ["written"] + [fill_value] * 3
+
+
+def test_zarr_v3_sharded_string_write_rejected(tmp_path):
+    filename = tmp_path / "test.zarr"
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=ZARR_V3"]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dim = rg.CreateDimension("x", None, None, 4)
+        ar = rg.CreateMDArray(
+            "ar",
+            [dim],
+            gdal.ExtendedDataType.CreateString(10),
+            ["BLOCKSIZE=4", "SHARD_CHUNK_SHAPE=2"],
+        )
+        metadata = (filename / "ar" / "zarr.json").read_bytes()
+        assert ar.Read() == [""] * 4
+        with gdal.quiet_errors():
+            assert (
+                ar.Write(["written"], array_start_idx=[0], count=[1]) == gdal.CE_Failure
+            )
+        assert (
+            "Writing sharded string arrays is not supported" in gdal.GetLastErrorMsg()
+        )
+        assert ar.Read() == [""] * 4
+    assert (filename / "ar" / "zarr.json").read_bytes() == metadata
+    assert not (filename / "ar" / "c").exists()
+
+
+def test_zarr_v3_legacy_fill_value_not_persisted(tmp_path):
+    filename = tmp_path / "test.zarr"
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=ZARR_V3"]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dim = rg.CreateDimension("x", None, None, 2)
+        rg.CreateMDArray("ar", [dim], gdal.ExtendedDataType.Create(gdal.GDT_Int16))
+    with gdal.OpenEx(
+        filename,
+        gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE,
+        open_options=["USE_FILL_VALUE_AS_NODATA=YES"],
+    ) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("ar")
+        assert ar.GetNoDataValueAsDouble() == 0
+        assert ar.SetUnit("m") == gdal.CE_None
+    j = json.loads((filename / "ar" / "zarr.json").read_text())
+    assert j["attributes"] == {"units": "m"}
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("ar").GetNoDataValueAsRaw() is None
+    # An explicit nodata setter does persist the inferred value when requested.
+    with gdal.OpenEx(
+        filename,
+        gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE,
+        open_options=["USE_FILL_VALUE_AS_NODATA=YES"],
+    ) as ds:
+        assert (
+            ds.GetRootGroup().OpenMDArray("ar").SetNoDataValueDouble(0) == gdal.CE_None
+        )
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("ar").GetNoDataValueAsDouble() == 0
 
 
 @pytest.mark.parametrize(
@@ -2921,7 +3276,13 @@ def test_zarr_read_numpy_datetime64_extension_zarr_v3(tmp_vsimem, extension_name
     assert data == (1000000000, 2000000000, NAT)
 
     # Check NaT is registered as nodata
-    assert ar.GetNoDataValueAsInt64() == NAT
+    assert ar.GetNoDataValueAsRaw() is None
+    with gdal.OpenEx(
+        dirname, gdal.OF_MULTIDIM_RASTER, open_options=["USE_FILL_VALUE_AS_NODATA=YES"]
+    ) as legacy_ds:
+        legacy_rg = legacy_ds.GetRootGroup()
+        legacy_ar = legacy_rg.OpenMDArray(legacy_rg.GetMDArrayNames()[0])
+        assert legacy_ar.GetNoDataValueAsInt64() == NAT
 
 
 @gdaltest.enable_exceptions()
@@ -2975,7 +3336,12 @@ def test_zarr_read_fill_value_v3(tmp_vsimem, data_type, fill_value, nodata):
     gdal.Mkdir(tmp_vsimem / "test.zarr", 0)
     gdal.FileFromMemBuffer(tmp_vsimem / "test.zarr/zarr.json", json.dumps(j))
     ds = gdal.Open(tmp_vsimem / "test.zarr")
-    assert ds.GetRasterBand(1).GetNoDataValue() == nodata
+    assert ds.GetRasterBand(1).GetNoDataValue() is None
+    assert struct.unpack("f", ds.ReadRaster(buf_type=gdal.GDT_Float32))[0] == nodata
+    with gdal.OpenEx(
+        tmp_vsimem / "test.zarr", open_options=["USE_FILL_VALUE_AS_NODATA=YES"]
+    ) as legacy_ds:
+        assert legacy_ds.GetRasterBand(1).GetNoDataValue() == nodata
 
 
 @gdaltest.enable_exceptions()
@@ -3045,9 +3411,11 @@ def test_zarr_read_fill_value_complex_datatype_v3(
             gdal.Open(tmp_vsimem / "test.zarr", gdal.OF_MULTIDIM_RASTER)
     else:
 
-        def open_and_modify():
-            ds = gdal.Open(
-                tmp_vsimem / "test.zarr", gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE
+        def open_and_modify(open_options):
+            ds = gdal.OpenEx(
+                tmp_vsimem / "test.zarr",
+                gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE,
+                open_options=open_options,
             )
             rg = ds.GetRootGroup()
             ar = rg.OpenMDArray("test")
@@ -3056,15 +3424,24 @@ def test_zarr_read_fill_value_complex_datatype_v3(
                 if ar.GetDataType().GetNumericDataType() == gdal.GDT_CFloat64
                 else "f"
             )
-            assert ar.GetNoDataValueAsRaw() == bytes(
-                array.array(dtype, nodata)
-            ), struct.unpack(dtype * 2, ar.GetNoDataValueAsRaw())
+            assert ar.Read() == bytes(array.array(dtype, nodata))
+            if open_options:
+                assert ar.GetNoDataValueAsRaw() == bytes(array.array(dtype, nodata))
+            else:
+                assert ar.GetNoDataValueAsRaw() is None
 
             # To force a reserialization of the array
-            attr = ar.CreateAttribute("attr", [], gdal.ExtendedDataType.CreateString())
+            attr = (
+                ar.GetAttribute("attr")
+                if open_options
+                else ar.CreateAttribute(
+                    "attr", [], gdal.ExtendedDataType.CreateString()
+                )
+            )
             attr.Write("foo")
 
-        open_and_modify()
+        open_and_modify([])
+        open_and_modify(["USE_FILL_VALUE_AS_NODATA=YES"])
 
         if not str(fill_value[0]).startswith("0x"):
             f = gdal.VSIFOpenL(tmp_vsimem / "test.zarr/zarr.json", "rb")
@@ -8499,7 +8876,7 @@ def test_zarr_write_sharded_explicit_nodata(tmp_path):
         f"{inner_y * inner_x}f",
         ar.Read(array_start_idx=[inner_y, inner_x], count=[inner_y, inner_x]),
     )
-    assert all(v == nodata for v in unwritten)
+    assert all(math.isnan(v) for v in unwritten)
 
 
 def test_zarr_write_sharded_3d(tmp_path):
@@ -8587,7 +8964,8 @@ def test_zarr_write_sharded_uint8_nodata255(tmp_path):
     unwritten = struct.unpack(
         "B" * (5 * 6), ar.Read(array_start_idx=[inner_y, inner_x], count=[5, 6])
     )
-    assert all(v == 255 for v in unwritten)
+    assert all(v == 0 for v in unwritten)
+    assert ar.GetNoDataValueAsDouble() == 255
 
 
 ###############################################################################

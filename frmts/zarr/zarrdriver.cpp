@@ -2058,6 +2058,21 @@ uint64_t ZarrRasterBand::GetNoDataValueAsUInt64(int *pbHasNoData)
 }
 
 /************************************************************************/
+/*                         DeleteNoDataValue()                          */
+/************************************************************************/
+
+CPLErr ZarrRasterBand::DeleteNoDataValue()
+{
+    auto poGDS = cpl::down_cast<ZarrDataset *>(poDS);
+    if (!poGDS->m_poSingleArray)
+        return m_poArray->SetRawNoDataValue(nullptr) ? CE_None : CE_Failure;
+    m_dfNoData.reset();
+    m_nNoDataInt64.reset();
+    m_nNoDataUInt64.reset();
+    return CE_None;
+}
+
+/************************************************************************/
 /*                           SetNoDataValue()                           */
 /************************************************************************/
 
