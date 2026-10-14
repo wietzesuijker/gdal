@@ -2234,7 +2234,6 @@ bool ZarrArray::IsEmptyBlock(const ZarrByteVectorQuickResize &abyBlock) const
     {
         const int nDTSize = static_cast<int>(m_oType.GetSize());
         const size_t nElts = abyBlock.size() / nDTSize;
-        const auto eDT = m_oType.GetNumericDataType();
         return GDALBufferHasOnlyNoData(abyBlock.data(), GetFillValueAsDouble(),
                                        nElts,        // nWidth
                                        1,            // nHeight
