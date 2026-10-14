@@ -95,6 +95,36 @@ Advise driver of upcoming read requests.
 
 See :cpp:func:`GDALDataset::AdviseRead`.
 
+Parameters
+----------
+xoff : int
+    The pixel offset to the left side of the region of interest.
+yoff : int
+    The line offset to the top side of the region of interest.
+xsize : int
+    The width of the region of interest, in pixels.
+ysize : int
+    The height of the region of interest, in lines.
+buf_xsize : int, optional
+    The width of the buffer the region will later be read into. By default,
+    equal to ``xsize``. A smaller value advises a downsampled
+    (e.g. overview-sized) read.
+buf_ysize : int, optional
+    The height of the buffer the region will later be read into. By default,
+    equal to ``ysize``.
+buf_type : int, optional
+    The data type (one of the ``GDT_*`` constants) of the buffer. By default,
+    the data type of the last band of the dataset.
+band_list : list of int, optional
+    1-based indices of the bands to advise. By default, all bands.
+options : dict or list, optional
+    Driver-specific options.
+
+Returns
+-------
+int
+    :py:const:`CE_None` on success or :py:const:`CE_Failure` on failure.
+
 ";
 
 %feature("docstring")  BuildOverviews "

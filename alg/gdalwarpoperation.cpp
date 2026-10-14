@@ -1030,11 +1030,16 @@ void GDALWarpOperation::CollectChunkList(int nDstXOff, int nDstYOff,
         // This is really a gross heuristics, but should work in most cases
         if (dfApproxAccArea >= dfTotalArea * 0.80)
         {
+            // Source chunks are read at full resolution (see
+            // WarpRegionToBuffer()), so advise that resolution rather than
+            // the destination size, which would make overview-aware
+            // AdviseRead() implementations prefetch an unused overview.
             GDALDataset::FromHandle(psOptions->hSrcDS)
                 ->AdviseRead(nSrcXOff, nSrcYOff, nSrcX2Off - nSrcXOff,
-                             nSrcY2Off - nSrcYOff, nDstXSize, nDstYSize,
-                             psOptions->eWorkingDataType, psOptions->nBandCount,
-                             psOptions->panSrcBands, nullptr);
+                             nSrcY2Off - nSrcYOff, nSrcX2Off - nSrcXOff,
+                             nSrcY2Off - nSrcYOff, psOptions->eWorkingDataType,
+                             psOptions->nBandCount, psOptions->panSrcBands,
+                             nullptr);
         }
     }
 }

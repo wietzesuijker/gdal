@@ -957,7 +957,7 @@ def test_zarr_read_array_attributes():
         "int64array": [1234567890123, -1234567890123],
         "intdoublearray": [1, 2.5],
         "mixedstrintarray": ["foo", 1],
-        "null": "",
+        "null": None,
         "obj": {},
         "str": "foo",
         "strarray": ["foo", "bar"],
@@ -3339,6 +3339,76 @@ def test_zarr_create_array_bad_compressor(tmp_vsimem, format):
 
 
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+@pytest.mark.parametrize("object_type", ["group", "array"])
+def test_zarr_attribute_json_values_and_literal_names(tmp_path, format, object_type):
+    filename = tmp_path / "test.zarr"
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format, "CREATE_ZMETADATA=NO"]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        if object_type == "array":
+            ar = rg.CreateMDArray("ar", [], gdal.ExtendedDataType.Create(gdal.GDT_Byte))
+            assert ar is not None
+            assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+            ar = None
+        rg = None
+
+    attributes = {
+        "custom/path": "keep",
+        "/leading": 7,
+        "trailing/": 1.25,
+        "double//slash": [1, 2],
+        "strings/path": ["a", "b"],
+        "json/path": {"nested/key": None},
+        "null/path": None,
+        "text-null": "null",
+        "empty-string": "",
+        "delete/key": "remove",
+    }
+    target = filename if object_type == "group" else filename / "ar"
+    metadata_path = target / ("zarr.json" if format == "ZARR_V3" else ".zattrs")
+    if format == "ZARR_V3":
+        metadata = json.loads(metadata_path.read_text())
+        metadata["attributes"] = attributes
+    else:
+        metadata = attributes
+    metadata_path.write_text(json.dumps(metadata))
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        obj = rg if object_type == "group" else rg.OpenMDArray("ar")
+        attr = obj.GetAttribute("custom/path")
+        assert attr.Write("updated") == gdal.CE_None
+        attr = None
+        assert obj.DeleteAttribute("delete/key") == gdal.CE_None
+        attr = obj.CreateAttribute(
+            "new/null", [], gdal.ExtendedDataType.CreateString(0, gdal.GEDTST_JSON)
+        )
+        assert attr.Write(" \t null\n") == gdal.CE_None
+        attr = obj.CreateAttribute(
+            "new/json", [], gdal.ExtendedDataType.CreateString(0, gdal.GEDTST_JSON)
+        )
+        assert attr.Write({"literal/key": None}) == gdal.CE_None
+        attr = obj = rg = None
+
+    expected = dict(attributes)
+    expected["custom/path"] = "updated"
+    del expected["delete/key"]
+    expected.update({"new/null": None, "new/json": {"literal/key": None}})
+    rewritten = json.loads(metadata_path.read_text())
+    assert (rewritten["attributes"] if format == "ZARR_V3" else rewritten) == expected
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        obj = rg if object_type == "group" else rg.OpenMDArray("ar")
+        assert {attr.GetName() for attr in obj.GetAttributes()} == set(expected)
+        assert obj.GetAttribute("custom/path").Read() == "updated"
+        assert obj.GetAttribute("null/path").Read() is None
+        assert obj.GetAttribute("text-null").Read() == "null"
+        assert obj.GetAttribute("empty-string").Read() == ""
+        obj = rg = None
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
 def test_zarr_create_array_attributes(tmp_vsimem, format):
     def create():
         ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
@@ -4675,8 +4745,8 @@ def test_zarr_iread_auto_parallel(tmp_path, format):
         # Full read
         assert ar.Read() == expected_full
 
-        # Strided read (step > 1): verifies adjusted count passed to
-        # IAdviseRead covers the full element range, not just count elements.
+        # Strided reads visit their requested chunks without prefetching
+        # chunks in the gaps.
         assert (
             ar.Read(
                 array_start_idx=[0, 0],
@@ -4803,6 +4873,304 @@ def test_zarr_advise_read_cache_preserved(tmp_path, format):
         ds = None
 
     assert got == expected
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+@pytest.mark.parametrize(
+    "use_exceptions,warning_after_error", [(False, False), (True, False), (False, True)]
+)
+def test_zarr_advise_read_corrupted_chunk_multithreaded(
+    tmp_vsimem, format, use_exceptions, warning_after_error
+):
+    """Worker errors reach the caller without hanging or caching a failed
+    prefetch, and a repaired chunk can be prefetched successfully."""
+
+    filename = tmp_vsimem / "test.zarr"
+
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dim_y = rg.CreateDimension("Y", None, None, 256)
+        dim_x = rg.CreateDimension("X", None, None, 256)
+        ar = rg.CreateMDArray(
+            "test",
+            [dim_y, dim_x],
+            gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+            ["BLOCKSIZE=16,16"],
+        )
+        expected = array.array("B", [(i % 256) for i in range(256 * 256)])
+        ar.Write(expected)
+        ar = rg = dim_y = dim_x = None
+
+    chunk = filename / "test" / ("0.0" if format == "ZARR_V2" else "c/0/0")
+    assert gdal.VSIStatL(chunk) is not None
+    with gdal.VSIFile(chunk, "rb") as f:
+        chunk_data = f.read()
+    gdal.FileFromMemBuffer(chunk, b"corrupted")
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("test")
+        with gdal.ExceptionMgr(useExceptions=use_exceptions):
+            for _ in range(2):
+                gdal.ErrorReset()
+                if use_exceptions:
+                    with pytest.raises(RuntimeError, match="has not expected size"):
+                        ar.AdviseRead(options=["NUM_THREADS=4"])
+                elif warning_after_error:
+                    errors = []
+
+                    def handler(level, number, message):
+                        errors.append((level, number, message))
+                        if level == gdal.CE_Failure:
+                            gdal.Error(gdal.CE_Warning, gdal.CPLE_AppDefined, "warning")
+
+                    with gdaltest.error_handler(handler):
+                        assert (
+                            ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+                        )
+                    assert errors == [
+                        (gdal.CE_Failure, gdal.CPLE_AppDefined, gdal.GetLastErrorMsg()),
+                        (gdal.CE_Warning, gdal.CPLE_AppDefined, "warning"),
+                    ]
+                else:
+                    with gdaltest.error_raised(gdal.CE_Failure, match=str(chunk)):
+                        assert (
+                            ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+                        )
+                assert gdal.GetLastErrorType() == gdal.CE_Failure
+                assert gdal.GetLastErrorNo() == gdal.CPLE_AppDefined
+                assert "has not expected size" in gdal.GetLastErrorMsg()
+                assert str(chunk) in gdal.GetLastErrorMsg()
+
+            gdal.FileFromMemBuffer(chunk, chunk_data)
+            assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_None
+            gdal.Unlink(chunk)
+            assert ar.Read() == expected.tobytes()
+        ar = None
+
+
+@pytest.mark.parametrize("num_threads", [1, 2])
+@pytest.mark.parametrize("use_exceptions", [False, True])
+@pytest.mark.parametrize("corruption", ["missing", "index", "chunk"])
+def test_zarr_advise_read_sharded_failure(
+    tmp_vsimem, num_threads, use_exceptions, corruption
+):
+    if "zstd" not in gdal.GetDriverByName("ZARR").GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_vsimem / "test.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("Y", 4), ("X", 4)],
+        [2, 2],
+        [1, 1],
+        gdal.GDT_UInt8,
+        ["COMPRESS=ZSTD"],
+    )
+    expected = bytearray(range(1, 17))
+    ar.SetNoDataValueDouble(0)
+    assert ar.Write(expected) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    shard = filename / "data/c/0/0"
+    with gdal.VSIFile(shard, "rb") as f:
+        shard_data = f.read()
+    if corruption == "missing":
+        gdal.Unlink(shard)
+        for i in (0, 1, 4, 5):
+            expected[i] = 0
+    else:
+        gdal.FileFromMemBuffer(
+            shard, b"bad" if corruption == "index" else b"bad" + shard_data[3:]
+        )
+
+    message = (
+        "shard file too small"
+        if corruption == "index"
+        else "Error while retrieving decompressed size of ZSTD frame"
+    )
+    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            with gdal.ExceptionMgr(useExceptions=use_exceptions):
+                for _ in range(2):
+                    gdal.ErrorReset()
+                    if corruption == "missing":
+                        assert ar.AdviseRead() == gdal.CE_None
+                    elif use_exceptions:
+                        with pytest.raises(RuntimeError, match=message):
+                            ar.AdviseRead()
+                    else:
+                        with gdaltest.error_raised(gdal.CE_Failure, match=message):
+                            assert ar.AdviseRead() == gdal.CE_Failure
+                    if corruption != "missing":
+                        assert gdal.GetLastErrorType() == gdal.CE_Failure
+                        assert gdal.GetLastErrorNo() == gdal.CPLE_AppDefined
+
+                if corruption != "missing":
+                    gdal.FileFromMemBuffer(shard, shard_data)
+                    assert ar.AdviseRead() == gdal.CE_None
+                for y in range(2):
+                    for x in range(2):
+                        shard_path = filename / f"data/c/{y}/{x}"
+                        if gdal.VSIStatL(shard_path) is not None:
+                            assert gdal.Unlink(shard_path) == 0
+                assert ar.Read() == expected
+            ar = None
+
+
+@pytest.mark.parametrize(
+    "format,sharded", [("ZARR_V2", False), ("ZARR_V3", False), ("ZARR_V3", True)]
+)
+@pytest.mark.parametrize("step", [3, -3])
+@pytest.mark.parametrize("num_threads", [None, "2"])
+@gdaltest.enable_exceptions()
+def test_zarr_strided_read_skips_corrupt_chunks(
+    tmp_vsimem, format, sharded, step, num_threads
+):
+    filename = tmp_vsimem / "test.zarr"
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dims = [rg.CreateDimension(n, None, None, s) for n, s in [("Y", 2), ("X", 6)]]
+        options = (
+            ["BLOCKSIZE=1,3", "SHARD_CHUNK_SHAPE=1,1", "COMPRESS=GZIP"]
+            if sharded
+            else ["BLOCKSIZE=1,1"]
+        )
+        ar = rg.CreateMDArray(
+            "data", dims, gdal.ExtendedDataType.Create(gdal.GDT_UInt8), options
+        )
+        ar.SetNoDataValueDouble(255)
+        assert ar.Write(bytes(range(1, 13))) == gdal.CE_None
+        ar = rg = dims = None
+
+    if sharded:
+        shard = filename / "data/c/0/0"
+        with gdal.VSIFile(shard, "rb") as f:
+            data = bytearray(f.read())
+        offset, size = struct.unpack_from("<QQ", data, len(data) - 52 + 16)
+        data[offset : offset + size] = b"X" * size
+        gdal.FileFromMemBuffer(shard, data)
+    else:
+        chunk = filename / "data" / ("0.1" if format == "ZARR_V2" else "c/0/1")
+        gdal.FileFromMemBuffer(chunk, b"")
+
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            gdal.ErrorReset()
+            with gdaltest.error_raised(gdal.CE_None):
+                assert ar.Read(
+                    array_start_idx=[0, 0 if step > 0 else 3],
+                    count=[1, 2],
+                    array_step=[1, step],
+                ) == (bytes([1, 4]) if step > 0 else bytes([4, 1]))
+            assert gdal.GetLastErrorType() == gdal.CE_None
+            ar = None
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+@pytest.mark.parametrize("corrupted", [False, True])
+def test_zarr_advise_read_cache_after_incomplete_chunk(tmp_vsimem, format, corrupted):
+    """A failed prefetch must not mark its entire window as cached. Missing
+    chunks are valid fill-value chunks and can be cached normally."""
+
+    filename = tmp_vsimem / "test.zarr"
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    )
+    rg = ds.GetRootGroup()
+    dims = [rg.CreateDimension(name, None, None, 256) for name in ("Y", "X")]
+    ar = rg.CreateMDArray(
+        "test", dims, gdal.ExtendedDataType.Create(gdal.GDT_UInt8), ["BLOCKSIZE=16,16"]
+    )
+    ar.SetNoDataValueDouble(0)
+    expected = bytearray(i % 251 for i in range(256 * 256))
+    ar.Write(expected)
+    ds.Close()
+
+    # Corrupt the last chunk so that its worker has already cached chunks
+    # before reporting failure, independently of the thread scheduling.
+    chunk = filename / "test" / ("15.15" if format == "ZARR_V2" else "c/15/15")
+    f = gdal.VSIFOpenL(chunk, "rb")
+    chunk_data = gdal.VSIFReadL(1, 256, f)
+    gdal.VSIFCloseL(f)
+    if corrupted:
+        gdal.FileFromMemBuffer(chunk, b"corrupted")
+    else:
+        gdal.Unlink(chunk)
+        for y in range(240, 256):
+            expected[y * 256 + 240 : (y + 1) * 256] = bytes(16)
+
+    ds = gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE)
+    ar = ds.GetRootGroup().OpenMDArray("test")
+    with gdal.quiet_errors():
+        for _ in range(2):
+            assert ar.AdviseRead(options=["NUM_THREADS=4"]) == (
+                gdal.CE_Failure if corrupted else gdal.CE_None
+            )
+
+    if corrupted:
+        gdal.FileFromMemBuffer(chunk, chunk_data)
+        assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_None
+
+    # A successful retry (or a valid missing chunk) populates the cache.
+    gdal.Unlink(filename / "test" / ("0.0" if format == "ZARR_V2" else "c/0/0"))
+    assert ar.Read() == expected
+
+    ds.GetRootGroup().DeleteMDArray("test")
+    with gdaltest.error_raised(gdal.CE_Failure, match="has been deleted"):
+        assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+    with gdal.ExceptionMgr(useExceptions=True), pytest.raises(
+        RuntimeError, match="has been deleted"
+    ):
+        ar.AdviseRead(options=["NUM_THREADS=4"])
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+def test_zarr_advise_read_cache_preserved_by_unaligned_read(tmp_path, format):
+    """The implicit AdviseRead() of an unaligned classic raster read does not
+    discard the cache of a previous AdviseRead() covering it."""
+
+    filename = str(tmp_path / "test.zarr")
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 60)
+    dim_x = rg.CreateDimension("X", None, None, 80)
+    ar = rg.CreateMDArray(
+        "test",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=20,20"],
+    )
+    ar.Write(array.array("B", [(i % 256) for i in range(60 * 80)]))
+    ds = None
+
+    ds = gdal.Open(filename)
+    expected = ds.ReadRaster(5, 5, 50, 40)
+    ds = None
+
+    with gdal.config_option("GDAL_NUM_THREADS", "ALL_CPUS"):
+        ds = gdal.Open(filename)
+        ds.GetRasterBand(1).AdviseRead(0, 0, 80, 60)
+
+        # Delete chunk files - Read must succeed from cache
+        for p in tmp_path.rglob("*"):
+            if (
+                p.is_file()
+                and p.suffix not in (".json",)
+                and not p.name.startswith(".z")
+            ):
+                p.unlink()
+
+        assert ds.ReadRaster(5, 5, 50, 40) == expected
 
 
 def test_zarr_read_invalid_nczarr_dim(tmp_vsimem):
@@ -6456,7 +6824,9 @@ def test_zarr_v3_partial_write_missing_string_chunk(
         "data_type": data_type,
         "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
         "chunk_key_encoding": {"name": "default"},
-        "fill_value": "fill",
+        "fill_value": (
+            base64.b64encode(b"fill").decode("ascii") if codec == "bytes" else "fill"
+        ),
         "codecs": [{"name": codec}],
     }
     (filename / "zarr.json").write_text(json.dumps(metadata))
@@ -6575,8 +6945,9 @@ def test_zarr_read_imagecodecs_tiff_errors(dirname):
 
 @gdaltest.enable_exceptions()
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
-def test_zarr_write_error_at_close_on_group(tmp_path, format):
-    out_filename = tmp_path / "test.zarr"
+def test_zarr_write_error_at_close_on_group(tmp_path, format, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out_filename = "test.zarr"
 
     ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
         out_filename, options=["FORMAT=" + format]
@@ -6603,8 +6974,9 @@ def test_zarr_write_error_at_close_on_group(tmp_path, format):
 
 @gdaltest.enable_exceptions()
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
-def test_zarr_write_error_at_close_on_array(tmp_path, format):
-    out_filename = tmp_path / "test.zarr"
+def test_zarr_write_error_at_close_on_array(tmp_path, format, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out_filename = "test.zarr"
 
     ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
         out_filename, options=["FORMAT=" + format]
@@ -6973,8 +7345,8 @@ def test_zarr_read_simple_sharding_read_errors(tmp_vsimem):
             except Exception as e:
                 error_msgs += str(e) + "\n"
 
-    assert "DecodePartial(): cannot decode chunk 0" in error_msgs
-    assert "cannot decode chunk" in error_msgs
+    assert "Error while retrieving decompressed size of ZSTD frame" in error_msgs
+    assert "BatchDecodePartial: cannot decode chunk" in error_msgs
 
 
 ###############################################################################
@@ -8635,6 +9007,228 @@ def test_zarr_v3_read_fixed_length_string_dtypes(
     assert ar.Read() == expected_values
 
 
+def test_zarr_v3_resize_preserves_attributes(tmp_path):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    attributes = {
+        "description": "keep",
+        "units": "metre",
+        "scale_factor": 2.0,
+        "add_offset": 3.0,
+        "custom": {"values": [1, 2]},
+        "nothing": None,
+        "custom/path": "literal",
+    }
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": "uint8",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": 0,
+        "codecs": [{"name": "bytes"}],
+        "attributes": attributes,
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    for size in (4, 5):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Resize([size]) == gdal.CE_None
+            ar = rg = None
+        rewritten = json.loads((filename / "zarr.json").read_text())
+        assert rewritten["attributes"] == attributes
+        assert rewritten["data_type"] == "uint8"
+        assert rewritten["shape"] == [size]
+
+
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize(
+    "type_name,length_bytes,encoding,value,fill_value",
+    [
+        ("null_terminated_bytes", 8, "ascii", "abcdefg", ""),
+        ("fixed_length_utf32", 16, "utf-32-le", "é水😀", ""),
+        ("fixed_length_utf32", 16, "utf-32-le", "é水😀", "f"),
+    ],
+)
+def test_zarr_v3_resize_fixed_length_string_dtype(
+    tmp_path, type_name, length_bytes, encoding, value, fill_value, has_chunk
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    data_type = {"name": type_name, "configuration": {"length_bytes": length_bytes}}
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "attributes": {"description": "keep"},
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    chunk = bytes(length_bytes) + value.encode(encoding).ljust(length_bytes, b"\0")
+    if has_chunk:
+        (filename / "c").mkdir()
+        (filename / "c/0").write_bytes(chunk)
+    expected = ["", value] if has_chunk else [fill_value] * 2
+
+    for size in (4, 5):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            assert ar.Resize([size]) == gdal.CE_None
+            ar = rg = None
+
+        rewritten = json.loads((filename / "zarr.json").read_text())
+        assert rewritten["data_type"] == data_type
+        assert rewritten["shape"] == [size]
+        assert rewritten["fill_value"] == fill_value
+        assert rewritten["codecs"] == metadata["codecs"]
+        assert rewritten["attributes"] == metadata["attributes"]
+        if has_chunk:
+            assert (filename / "c/0").read_bytes() == chunk
+        expected += [fill_value] * (size - len(expected))
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            ar = rg = None
+
+
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize(
+    "type_name,fill_value",
+    [
+        ("null_terminated_bytes", ""),
+        ("null_terminated_bytes", "f"),
+        ("null_terminated_bytes", "Zg=="),
+        ("null_terminated_bytes", "é"),
+        ("fixed_length_utf32", "f"),
+        ("string", "Zg=="),
+    ],
+)
+def test_zarr_v3_string_fill_roundtrip(tmp_path, type_name, fill_value, has_chunk):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    if type_name == "string":
+        data_type = type_name
+        codecs = [{"name": "vlen-utf8"}]
+        chunk = struct.pack("<III", 2, 0, 3) + b"abc"
+    else:
+        length_bytes = 8 if type_name == "null_terminated_bytes" else 16
+        data_type = {"name": type_name, "configuration": {"length_bytes": length_bytes}}
+        codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+        encoding = "ascii" if type_name == "null_terminated_bytes" else "utf-32-le"
+        chunk = bytes(length_bytes) + "abc".encode(encoding).ljust(length_bytes, b"\0")
+    encoded_fill = (
+        base64.b64encode(fill_value.encode("utf-8")).decode("ascii")
+        if type_name == "null_terminated_bytes"
+        else fill_value
+    )
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": encoded_fill,
+        "codecs": codecs,
+        "attributes": {"description": "keep"},
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    if has_chunk:
+        (filename / "c").mkdir()
+        (filename / "c/0").write_bytes(chunk)
+    expected = ["", "abc"] if has_chunk else [fill_value] * 2
+    for size in (4, 5):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            assert ar.Resize([size]) == gdal.CE_None
+            ar = rg = None
+        expected += [fill_value] * (size - len(expected))
+        rewritten = json.loads((filename / "zarr.json").read_text())
+        for key in ("data_type", "fill_value", "codecs", "attributes"):
+            assert rewritten[key] == metadata[key]
+        if has_chunk:
+            assert (filename / "c/0").read_bytes() == chunk
+
+    if has_chunk:
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Write(["X"], array_start_idx=[0], count=[1]) == gdal.CE_None
+            ar = rg = None
+        expected[0] = "X"
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == expected
+        ar = rg = None
+
+
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize("native_fill", [b"a\0b", b"\0a", b"a\0", b"\0"])
+@gdaltest.enable_exceptions()
+def test_zarr_v3_s8_fill_null_bytes(tmp_path, native_fill, has_chunk):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    data_type = {"name": "null_terminated_bytes", "configuration": {"length_bytes": 8}}
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": base64.b64encode(native_fill).decode("ascii"),
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "attributes": {"description": "keep"},
+    }
+    original = json.dumps(metadata).encode("ascii")
+    (filename / "zarr.json").write_bytes(original)
+    chunk = bytes(8) + b"abc".ljust(8, b"\0")
+    if has_chunk:
+        (filename / "c").mkdir()
+        (filename / "c/0").write_bytes(chunk)
+    unpadded = native_fill.rstrip(b"\0")
+    if b"\0" in unpadded:
+        with pytest.raises(Exception, match="embedded NUL bytes.*fill_value"):
+            with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+                rg = ds.GetRootGroup()
+                rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert (filename / "zarr.json").read_bytes() == original
+    else:
+        fill = unpadded.decode("ascii")
+        expected = ["", "abc"] if has_chunk else [fill] * 2
+        for size in (3, 5):
+            with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+                rg = ds.GetRootGroup()
+                ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+                assert ar.Read() == expected
+                assert ar.Resize([size]) == gdal.CE_None
+                ar = rg = None
+            expected += [fill] * (size - len(expected))
+            rewritten = json.loads((filename / "zarr.json").read_text())
+            assert rewritten["fill_value"] == base64.b64encode(unpadded).decode("ascii")
+            assert rewritten["data_type"] == data_type
+            assert rewritten["attributes"] == metadata["attributes"]
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            ar = rg = None
+    if has_chunk:
+        assert (filename / "c/0").read_bytes() == chunk
+
+
 ###############################################################################
 # Test Zarr v3 sharded fixed-length string array
 
@@ -8673,6 +9267,109 @@ def _create_sharded_array(path, dims, shard, inner, dtype=gdal.GDT_Float32, opts
     ar = rg.CreateMDArray("data", gdal_dims, dt, co)
     assert ar is not None
     return ds, ar
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("existing_chunks", [False, True])
+@pytest.mark.parametrize("num_threads", [None, 1, 2])
+@pytest.mark.parametrize("followup", ["close", "strided_read", "partial_write"])
+def test_zarr_v3_threaded_write_cache_coherence(
+    tmp_path, compress, sharded, existing_chunks, num_threads, followup
+):
+    if compress == "ZSTD" and "zstd" not in gdal.GetDriverByName(
+        "ZARR"
+    ).GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_path / "out.zarr"
+    with gdal.config_option("GDAL_NUM_THREADS", None):
+        ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+            filename, options=["FORMAT=ZARR_V3"]
+        )
+        rg = ds.GetRootGroup()
+        dims = [rg.CreateDimension(name, None, None, 16) for name in ("y", "x")]
+        options = [f"COMPRESS={compress}", "BLOCKSIZE=4,4"]
+        if sharded:
+            options = [f"COMPRESS={compress}", "BLOCKSIZE=8,8", "SHARD_CHUNK_SHAPE=4,4"]
+        ar = rg.CreateMDArray(
+            "data", dims, gdal.ExtendedDataType.Create(gdal.GDT_Byte), options
+        )
+        assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+        if existing_chunks:
+            assert ar.Write(bytes([3] * 256)) == gdal.CE_None
+        ar = rg = None
+        ds.Close()
+
+    threads = None if num_threads is None else str(num_threads)
+    expected = bytearray([9] * 256)
+    with gdal.config_option("GDAL_NUM_THREADS", threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            for value, start in ((7, [1, 1]), (8, [5, 5])):
+                assert (
+                    ar.Write(bytes([value]), array_start_idx=start, count=[1, 1])
+                    == gdal.CE_None
+                )
+            assert ar.Write(expected) == gdal.CE_None
+            if followup == "strided_read":
+                assert ar.Read(
+                    array_start_idx=[4, 4], count=[2, 2], array_step=[2, 2]
+                ) == bytes([9] * 4)
+            elif followup == "partial_write":
+                assert (
+                    ar.Write(bytes([6]), array_start_idx=[5, 4], count=[1, 1])
+                    == gdal.CE_None
+                )
+                expected[5 * 16 + 4] = 6
+            ar = None
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("data").Read() == expected
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+def test_zarr_v3_threaded_write_pending_shard_flush_failure(tmp_path, compress):
+    compressors = gdal.GetDriverByName("Zarr").GetMetadataItem("COMPRESSORS")
+    if compress == "ZSTD" and "zstd" not in compressors:
+        pytest.skip("compressor zstd not available")
+    filename = tmp_path / "out.zarr"
+    with gdal.config_option("GDAL_NUM_THREADS", "1"):
+        ds, ar = _create_sharded_array(
+            filename,
+            [("y", 8), ("x", 8)],
+            [4, 4],
+            [2, 2],
+            gdal.GDT_Byte,
+            opts=[f"COMPRESS={compress}"],
+        )
+        assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+        assert ar.Write(bytes([3] * 64)) == gdal.CE_None
+        ar = None
+        ds.Close()
+    shard = filename / "data/c/0/0"
+    mode = shard.stat().st_mode
+    with gdal.config_option("GDAL_NUM_THREADS", "2"):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            assert (
+                ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                == gdal.CE_None
+            )
+            try:
+                shard.chmod(0o444)
+                if os.access(shard, os.W_OK):
+                    pytest.skip("cannot make shard read-only")
+                with gdaltest.error_raised(
+                    gdal.CE_Failure, match="Cannot create shard file"
+                ):
+                    assert ar.Write(bytes([9] * 64)) == gdal.CE_Failure
+            finally:
+                shard.chmod(mode)
+            assert ar.Write(bytes([9] * 64)) == gdal.CE_None
+            ar = None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("data").Read() == bytes([9] * 64)
 
 
 @pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
@@ -9296,6 +9993,97 @@ def test_zarr_build_overviews_classic_bridge(tmp_vsimem):
     ovr_band = band.GetOverview(0)
     assert ovr_band.XSize == 32 and ovr_band.YSize == 32
     assert len(ds.GetSubDatasets()) == 1
+
+
+###############################################################################
+# Test that a downsampled read served by an overview does not advise a read of
+# the full resolution array (https://github.com/OSGeo/gdal/issues/15380)
+
+
+def test_zarr_downsampled_read_does_not_advise_full_resolution(tmp_vsimem):
+
+    path = tmp_vsimem / "test.zarr"
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        path, options=["FORMAT=ZARR_V3"]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 256)
+    dim_x = rg.CreateDimension("X", None, None, 256)
+    ar = rg.CreateMDArray(
+        "data",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=64,64"],
+    )
+    ar.Write(array.array("B", [i % 251 for i in range(256 * 256)]))
+    assert ar.BuildOverviews("NEAREST", [4]) == gdal.CE_None
+    ds.Close()
+
+    ds = gdal.Open(path)
+    # Opening the overview warns about its null fill_value
+    with gdal.quiet_errors():
+        expected = ds.GetRasterBand(1).GetOverview(0).ReadRaster()
+
+    # The implicit AdviseRead() cache size is half of the block cache: too
+    # small for the 64 KB full resolution array, large enough for the 4 KB
+    # overview
+    with gdaltest.SetCacheMax(100000), gdaltest.error_raised(gdal.CE_None):
+        assert ds.GetRasterBand(1).ReadRaster(buf_xsize=64, buf_ysize=64) == expected
+        # gdal_translate -outsize issues an AdviseRead() on the source
+        out_ds = gdal.Translate(tmp_vsimem / "out.tif", ds, width=64, height=64)
+        assert out_ds.ReadRaster() == expected
+
+
+###############################################################################
+# gdalwarp reads the source at full resolution, so its AdviseRead() must not
+# be redirected to an overview
+
+
+def test_zarr_warp_without_overviews_does_not_advise_overview(tmp_vsimem):
+
+    path = tmp_vsimem / "test.zarr"
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        path, options=["FORMAT=ZARR_V3"]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 256)
+    dim_x = rg.CreateDimension("X", None, None, 256)
+    ar = rg.CreateMDArray(
+        "data",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=64,64"],
+    )
+    ar.Write(array.array("B", [1 + i % 250 for i in range(256 * 256)]))
+    assert ar.BuildOverviews("NEAREST", [4]) == gdal.CE_None
+    ds.Close()
+
+    ds = gdal.Open(path)
+    # Opening the overview warns about its null fill_value
+    with gdal.quiet_errors():
+        ovr = ds.GetRasterBand(1).GetOverview(0)
+
+    with gdaltest.config_option("GDAL_NUM_THREADS", "2"):
+        out_ds = gdal.Warp(
+            "",
+            ds,
+            format="MEM",
+            width=64,
+            height=64,
+            overviewLevel="NONE",
+            transformerOptions=[
+                "SRC_METHOD=NO_GEOTRANSFORM",
+                "DST_METHOD=NO_GEOTRANSFORM",
+            ],
+        )
+    assert 0 not in out_ds.ReadRaster()
+
+    # Had the warp AdviseRead() prefetched the overview, its chunk would
+    # still be served from the AdviseRead() cache
+    gdal.Unlink(path / "ovr_4x" / "data" / "c" / "0" / "0")
+    assert ovr.ReadRaster() == b"\x00" * (64 * 64)
 
 
 ###############################################################################
@@ -10128,3 +10916,396 @@ def test_zarr_build_overviews_multiband(tmp_path, after_reopen, get_ovr_after_bu
     assert ds.GetRasterBand(1).GetOverview(0).XSize == 2
     assert ds.GetRasterBand(1).GetOverview(0).XSize == 2
     assert ds.GetRasterBand(2).GetOverviewCount() == 1
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("existing_shards", [False, True])
+@pytest.mark.parametrize("advise_read", [False, True])
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_zarr_write_sharded_read_same_handle(
+    tmp_path, compress, existing_shards, advise_read, num_threads
+):
+    if compress == "ZSTD" and "zstd" not in gdal.GetDriverByName(
+        "ZARR"
+    ).GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 32), ("x", 32)],
+        [16, 16],
+        [8, 8],
+        gdal.GDT_UInt8,
+        [f"COMPRESS={compress}"],
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    expected = bytearray([3 if existing_shards else 0] * 1024)
+    if existing_shards:
+        assert ar.Write(expected) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            assert ar.Read() == expected
+            for values in (bytes([7] * 49), bytes(range(1, 50)), bytes([11] * 49)):
+                for start in (1, 17):
+                    assert (
+                        ar.Write(values, array_start_idx=[start, start], count=[7, 7])
+                        == gdal.CE_None
+                    )
+                    for y in range(7):
+                        offset = (start + y) * 32 + start
+                        expected[offset : offset + 7] = values[y * 7 : y * 7 + 7]
+                if advise_read:
+                    assert (
+                        ar.AdviseRead(options=[f"NUM_THREADS={num_threads}"])
+                        == gdal.CE_None
+                    )
+                assert ar.Read() == expected
+            ar = None
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("data").Read() == expected
+
+
+@pytest.mark.parametrize("advise_read", [False, True])
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_zarr_write_sharded_read_flush_failure(tmp_path, advise_read, num_threads):
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 8), ("x", 8)],
+        [4, 4],
+        [2, 2],
+        gdal.GDT_UInt8,
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    assert ar.Write(bytes([3] * 64)) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    shard = filename / "data/c/0/0"
+    mode = shard.stat().st_mode
+    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            try:
+                shard.chmod(0o444)
+                if os.access(shard, os.W_OK):
+                    pytest.skip("cannot make shard read-only")
+                assert (
+                    ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                    == gdal.CE_None
+                )
+                with gdaltest.error_raised(
+                    gdal.CE_Failure, match="Cannot create shard file"
+                ):
+                    if advise_read:
+                        assert (
+                            ar.AdviseRead(options=[f"NUM_THREADS={num_threads}"])
+                            == gdal.CE_Failure
+                        )
+                    else:
+                        assert ar.Read() is None
+            finally:
+                shard.chmod(mode)
+            assert (
+                ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                == gdal.CE_None
+            )
+            expected = bytearray([3] * 64)
+            expected[9] = 7
+            assert ar.Read() == expected
+            ar = None
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("existing_shards", [False, True])
+@pytest.mark.parametrize("num_threads", [None, "2"])
+@pytest.mark.parametrize("step", [2, -1, -2])
+def test_zarr_write_sharded_strided_read_same_handle(
+    tmp_path, compress, existing_shards, num_threads, step
+):
+    if compress == "ZSTD" and "zstd" not in gdal.GetDriverByName(
+        "ZARR"
+    ).GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 8), ("x", 8)],
+        [4, 4],
+        [2, 2],
+        gdal.GDT_UInt8,
+        [f"COMPRESS={compress}"],
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    original = 3 if existing_shards else 0
+    if existing_shards:
+        assert ar.Write(bytes([original] * 64)) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    indices = list(
+        range(0 if step > 0 else 7 if step == -1 else 6, 8 if step > 0 else -1, step)
+    )
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            for value in (7, 9, 11):
+                assert (
+                    ar.Write(bytes([value]), array_start_idx=[2, 2], count=[1, 1])
+                    == gdal.CE_None
+                )
+                expected = bytearray(
+                    value if y == 2 and x == 2 else original
+                    for y in indices
+                    for x in indices
+                )
+                assert (
+                    ar.Read(
+                        array_start_idx=[indices[0]] * 2,
+                        count=[len(indices)] * 2,
+                        array_step=[step] * 2,
+                    )
+                    == expected
+                )
+            ar = None
+
+
+@pytest.mark.parametrize("num_threads", [None, "2"])
+@pytest.mark.parametrize("step", [2, -1, -2])
+def test_zarr_write_sharded_strided_read_flush_failure(tmp_path, num_threads, step):
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 8), ("x", 8)],
+        [4, 4],
+        [2, 2],
+        gdal.GDT_UInt8,
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    assert ar.Write(bytes([3] * 64)) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    shard = filename / "data/c/0/0"
+    mode = shard.stat().st_mode
+    indices = list(
+        range(0 if step > 0 else 7 if step == -1 else 6, 8 if step > 0 else -1, step)
+    )
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            try:
+                shard.chmod(0o444)
+                if os.access(shard, os.W_OK):
+                    pytest.skip("cannot make shard read-only")
+                assert (
+                    ar.Write(bytes([7]), array_start_idx=[2, 2], count=[1, 1])
+                    == gdal.CE_None
+                )
+                with gdaltest.error_raised(
+                    gdal.CE_Failure, match="Cannot create shard file"
+                ):
+                    assert (
+                        ar.Read(
+                            array_start_idx=[indices[0]] * 2,
+                            count=[len(indices)] * 2,
+                            array_step=[step] * 2,
+                        )
+                        is None
+                    )
+            finally:
+                shard.chmod(mode)
+            assert (
+                ar.Write(bytes([7]), array_start_idx=[2, 2], count=[1, 1])
+                == gdal.CE_None
+            )
+            expected = bytearray([3] * 64)
+            expected[18] = 7
+            assert ar.Read() == expected
+            ar = None
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+@pytest.mark.parametrize("array_type,fill_value", [("h", -7), ("f", "NaN")])
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ([2], [11, 12, None, None]),
+        ([2, 3], [11, 12, 13, None, 14, 15, 16, None] + [None] * 8),
+    ],
+)
+@pytest.mark.parametrize("read_first", [False, True])
+def test_zarr_resize_partial_chunk_fill_value(
+    tmp_path, format, array_type, fill_value, shape, expected, read_first
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    chunks = [4] * len(shape)
+    metadata = {"shape": shape, "fill_value": fill_value}
+    if format == "ZARR_V2":
+        metadata.update(
+            zarr_format=2,
+            chunks=chunks,
+            dtype="<i2" if array_type == "h" else "<f4",
+            order="C",
+            compressor=None,
+            filters=None,
+        )
+        metadata_filename = ".zarray"
+    else:
+        metadata.update(
+            zarr_format=3,
+            node_type="array",
+            data_type="int16" if array_type == "h" else "float32",
+            chunk_grid={"name": "regular", "configuration": {"chunk_shape": chunks}},
+            chunk_key_encoding={"name": "default"},
+            codecs=[{"name": "bytes", "configuration": {"endian": "little"}}],
+        )
+        metadata_filename = "zarr.json"
+    (filename / metadata_filename).write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        if read_first:
+            assert ar.Read() is not None
+        values = array.array(array_type, range(11, 11 + math.prod(shape)))
+        assert ar.Write(values) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Resize(chunks) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        actual = array.array(array_type, ar.Read())
+        assert len(actual) == len(expected)
+        for got, value in zip(actual, expected):
+            if value is None and fill_value == "NaN":
+                assert math.isnan(got)
+            else:
+                assert got == (fill_value if value is None else value)
+
+
+@pytest.mark.parametrize(
+    "data_type,codec",
+    [
+        ("string", "vlen-utf8"),
+        (
+            {"name": "null_terminated_bytes", "configuration": {"length_bytes": 8}},
+            "bytes",
+        ),
+    ],
+)
+@pytest.mark.parametrize("read_first", [False, True])
+def test_zarr_partial_string_chunk_padding_fill_value(
+    tmp_path, data_type, codec, read_first
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": (
+            base64.b64encode(b"fill").decode("ascii") if codec == "bytes" else "fill"
+        ),
+        "codecs": [{"name": codec}],
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        if read_first:
+            assert ar.Read() == ["fill", "fill"]
+        assert ar.Write(["first", "second"]) == gdal.CE_None
+    metadata["shape"] = [4]
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == ["first", "second", "fill", "fill"]
+
+
+@pytest.mark.parametrize("num_threads", [None, "1", "2"])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize(
+    "data_type,array_type,fill_value",
+    [("float32", "f", -7), ("uint64", "Q", (1 << 63) + 3)],
+)
+def test_zarr_v3_threaded_write_edge_fill(
+    tmp_path, num_threads, sharded, compressed, data_type, array_type, fill_value
+):
+    if compressed and "zstd" not in gdal.GetDriverByName("Zarr").GetMetadataItem(
+        "COMPRESSORS"
+    ):
+        pytest.skip("zstd compressor not available")
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    if compressed:
+        codecs.append({"name": "zstd", "configuration": {"level": 3}})
+    if sharded:
+        codecs = [
+            {
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [1, 2],
+                    "codecs": codecs,
+                    "index_codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                        {"name": "crc32c"},
+                    ],
+                    "index_location": "end",
+                },
+            }
+        ]
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [3, 5],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2, 4]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": codecs,
+        "attributes": {},
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.SetNoDataValueDouble(99) == gdal.CE_None
+            assert ar.Write(array.array(array_type, [9] * 15)) == gdal.CE_None
+            ar = rg = None
+    written_metadata = json.loads((filename / "zarr.json").read_text())
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == array.array(array_type, [9] * 15)
+        assert ar.Resize([4, 8]) == gdal.CE_None
+        ar = rg = None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        expected = array.array(
+            array_type,
+            [9 if y < 3 and x < 5 else fill_value for y in range(4) for x in range(8)],
+        )
+        assert ar.Read() == expected
+        assert ar.GetNoDataValueAsDouble() == 99
+        ar = rg = None
+    rewritten = json.loads((filename / "zarr.json").read_text())
+    assert rewritten["fill_value"] == fill_value
+    assert rewritten["attributes"] == written_metadata["attributes"]
