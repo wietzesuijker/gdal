@@ -1799,6 +1799,7 @@ bool ZarrV3Array::WriteChunksThreadSafe(
     };
 
     const size_t nDTSize = m_oType.GetSize();
+    const auto *pabyFillValue = GetRawFillValue();
     const size_t nDstSize =
         static_cast<size_t>(MultiplyElements(m_anOuterBlockSize)) * nDTSize;
     ZarrByteVectorQuickResize abyDst;
@@ -1852,7 +1853,15 @@ bool ZarrV3Array::WriteChunksThreadSafe(
         // during compression.
         abyDst.resize(nDstSize);
         if (bPartialChunk)
-            memset(abyDst.data(), 0, nDstSize);
+        {
+            if (pabyFillValue)
+                GDALCopyWords64(pabyFillValue, m_oType.GetNumericDataType(), 0,
+                                abyDst.data(), m_oType.GetNumericDataType(),
+                                static_cast<int>(nDTSize),
+                                static_cast<GPtrDiff_t>(nDstSize / nDTSize));
+            else
+                memset(abyDst.data(), 0, nDstSize);
+        }
 
         ExtractSubArray(static_cast<const GByte *>(pSrcBuffer), anSrcStart,
                         anSrcStrideElts, anCount, abyDst.data(),

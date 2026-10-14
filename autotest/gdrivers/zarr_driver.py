@@ -10128,3 +10128,78 @@ def test_zarr_build_overviews_multiband(tmp_path, after_reopen, get_ovr_after_bu
     assert ds.GetRasterBand(1).GetOverview(0).XSize == 2
     assert ds.GetRasterBand(1).GetOverview(0).XSize == 2
     assert ds.GetRasterBand(2).GetOverviewCount() == 1
+
+
+@pytest.mark.parametrize("num_threads", [None, "1", "2"])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize(
+    "data_type,array_type,fill_value",
+    [("float32", "f", -7), ("uint64", "Q", (1 << 63) + 3)],
+)
+def test_zarr_v3_threaded_write_edge_fill(
+    tmp_path, num_threads, sharded, compressed, data_type, array_type, fill_value
+):
+    if compressed and "zstd" not in gdal.GetDriverByName("Zarr").GetMetadataItem(
+        "COMPRESSORS"
+    ):
+        pytest.skip("zstd compressor not available")
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    if compressed:
+        codecs.append({"name": "zstd", "configuration": {"level": 3}})
+    if sharded:
+        codecs = [
+            {
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [1, 2],
+                    "codecs": codecs,
+                    "index_codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                        {"name": "crc32c"},
+                    ],
+                    "index_location": "end",
+                },
+            }
+        ]
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [3, 5],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2, 4]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": codecs,
+        "attributes": {},
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.SetNoDataValueDouble(99) == gdal.CE_None
+            assert ar.Write(array.array(array_type, [9] * 15)) == gdal.CE_None
+            ar = rg = None
+    written_metadata = json.loads((filename / "zarr.json").read_text())
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == array.array(array_type, [9] * 15)
+        assert ar.Resize([4, 8]) == gdal.CE_None
+        ar = rg = None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        expected = array.array(
+            array_type,
+            [9 if y < 3 and x < 5 else fill_value for y in range(4) for x in range(8)],
+        )
+        assert ar.Read() == expected
+        assert ar.GetNoDataValueAsDouble() == 99
+        ar = rg = None
+    rewritten = json.loads((filename / "zarr.json").read_text())
+    assert rewritten["fill_value"] == fill_value
+    assert rewritten["attributes"] == written_metadata["attributes"]
