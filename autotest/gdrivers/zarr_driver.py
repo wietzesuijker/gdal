@@ -4467,7 +4467,6 @@ def test_zarr_advise_read_corrupted_chunk_multithreaded(tmp_vsimem, format):
 
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
 @pytest.mark.parametrize("corrupted", [False, True])
-@gdaltest.disable_exceptions()
 def test_zarr_advise_read_cache_after_incomplete_chunk(tmp_vsimem, format, corrupted):
     """A failed prefetch must not mark its entire window as cached. Missing
     chunks are valid fill-value chunks and can be cached normally."""
@@ -4516,9 +4515,12 @@ def test_zarr_advise_read_cache_after_incomplete_chunk(tmp_vsimem, format, corru
     assert ar.Read() == expected
 
     ds.GetRootGroup().DeleteMDArray("test")
-    with gdal.quiet_errors():
+    with gdaltest.error_raised(gdal.CE_Failure, match="has been deleted"):
         assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
-    assert "has been deleted" in gdal.GetLastErrorMsg()
+    with gdal.ExceptionMgr(useExceptions=True), pytest.raises(
+        RuntimeError, match="has been deleted"
+    ):
+        ar.AdviseRead(options=["NUM_THREADS=4"])
 
 
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
