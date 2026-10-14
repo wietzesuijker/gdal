@@ -185,15 +185,33 @@ bool ZarrV3Array::Serialize(const CPLJSONObject &oAttrs)
     }
     else if (m_pabyNoData == nullptr)
     {
+        // fill_value is mandatory in Zarr V3 and null is not valid for these
+        // data types. Keep the existing NaN default for floating point arrays.
         if (m_oType.GetNumericDataType() == GDT_Float16 ||
             m_oType.GetNumericDataType() == GDT_Float32 ||
             m_oType.GetNumericDataType() == GDT_Float64)
         {
             oRoot.Add("fill_value", "NaN");
         }
+        else if (m_oType.GetClass() == GEDTC_STRING)
+        {
+            oRoot.Add("fill_value", "");
+        }
+        else if (GDALDataTypeIsComplex(m_oType.GetNumericDataType()))
+        {
+            CPLJSONArray oArray;
+            oArray.Add(0.0);
+            oArray.Add(0.0);
+            oRoot.Add("fill_value", oArray);
+        }
+        else if (m_dtype.GetType() == CPLJSONObject::Type::String &&
+                 m_dtype.ToString() == "bool")
+        {
+            oRoot.Add("fill_value", false);
+        }
         else
         {
-            oRoot.AddNull("fill_value");
+            oRoot.Add("fill_value", 0);
         }
     }
     else

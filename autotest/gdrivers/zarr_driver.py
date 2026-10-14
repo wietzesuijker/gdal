@@ -2082,11 +2082,133 @@ def test_zarr_create_array(tmp_vsimem, datatype, nodata, format):
                 assert got_nodata == nodata
         else:
             if format == "ZARR_V3":
-                assert ar.GetNoDataValueAsRaw() is None or math.isnan(
-                    ar.GetNoDataValueAsDouble()
-                )
+                # fill_value is mandatory in V3: the default value of the data
+                # type is written and reported as nodata
+                if datatype.GetClass() == gdal.GEDTC_NUMERIC:
+                    got_nodata = ar.GetNoDataValueAsDouble()
+                    if datatype.GetNumericDataType() in (
+                        gdal.GDT_Float16,
+                        gdal.GDT_Float32,
+                        gdal.GDT_Float64,
+                    ):
+                        assert math.isnan(got_nodata)
+                    else:
+                        assert got_nodata == 0
+                elif datatype.GetClass() == gdal.GEDTC_STRING:
+                    assert ar.GetNoDataValueAsString() == ""
+                else:
+                    assert ar.GetNoDataValueAsRaw() is None
             else:
                 assert ar.GetNoDataValueAsRaw() is None
+
+
+@pytest.mark.parametrize(
+    "datatype,expected_fill_value",
+    [
+        (gdal.ExtendedDataType.Create(gdal.GDT_UInt8), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Int8), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_UInt16), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Int16), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_UInt32), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Int32), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Int64), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_UInt64), 0),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Float16), "NaN"),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Float32), "NaN"),
+        (gdal.ExtendedDataType.Create(gdal.GDT_Float64), "NaN"),
+        (gdal.ExtendedDataType.Create(gdal.GDT_CFloat32), [0.0, 0.0]),
+        (gdal.ExtendedDataType.Create(gdal.GDT_CFloat64), [0.0, 0.0]),
+        (gdal.ExtendedDataType.CreateString(10), ""),
+    ],
+)
+@pytest.mark.parametrize("delete_nodata", [False, True])
+def test_zarr_v3_create_array_without_nodata_fill_value(
+    tmp_vsimem, datatype, expected_fill_value, delete_nodata
+):
+    """Creating an array or deleting nodata must leave a valid fill value."""
+
+    with gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        tmp_vsimem / "test.zarr", options=["FORMAT=ZARR_V3"]
+    ) as ds:
+        rg = ds.GetRootGroup()
+        dim0 = rg.CreateDimension("dim0", None, None, 2)
+        ar = rg.CreateMDArray("my_ar", [dim0], datatype)
+        assert ar
+        assert ar.GetNoDataValueAsRaw() is None
+
+    if delete_nodata:
+        with gdal.OpenEx(
+            tmp_vsimem / "test.zarr", gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE
+        ) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("my_ar")
+            assert ar.DeleteNoDataValue() == gdal.CE_None
+            assert ar.GetNoDataValueAsRaw() is None
+
+    with gdal.VSIFile(tmp_vsimem / "test.zarr" / "my_ar" / "zarr.json", "rb") as f:
+        assert json.loads(f.read())["fill_value"] == expected_fill_value
+
+    gdal.ErrorReset()
+    with gdal.OpenEx(tmp_vsimem / "test.zarr", gdal.OF_MULTIDIM_RASTER) as ds:
+        assert gdal.GetLastErrorType() == gdal.CE_None, gdal.GetLastErrorMsg()
+        ar = ds.GetRootGroup().OpenMDArray("my_ar")
+        assert ar
+        assert gdal.GetLastErrorType() == gdal.CE_None, gdal.GetLastErrorMsg()
+        # The default fill_value is reported as nodata on reopen, as for any
+        # Zarr array with a fill_value (already the case of NaN for floats)
+        if datatype.GetClass() == gdal.GEDTC_STRING:
+            assert ar.GetNoDataValueAsString() == ""
+        elif expected_fill_value == "NaN":
+            assert math.isnan(ar.GetNoDataValueAsDouble())
+        else:
+            assert ar.GetNoDataValueAsRaw() == bytes(datatype.GetSize())
+
+
+def test_zarr_v3_delete_nodata_bool_fill_value(tmp_vsimem):
+
+    filename = tmp_vsimem / "test.zarr"
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": "bool",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": True,
+        "codecs": [{"name": "bytes"}],
+    }
+    gdal.Mkdir(filename, 0)
+    gdal.FileFromMemBuffer(filename / "zarr.json", json.dumps(metadata))
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.GetNoDataValueAsDouble() == 1
+        assert ar.DeleteNoDataValue() == gdal.CE_None
+
+    with gdal.VSIFile(filename / "zarr.json", "rb") as f:
+        assert json.loads(f.read())["fill_value"] is False
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.GetNoDataValueAsDouble() == 0
+        assert ar.Read() == bytes([0, 0])
+
+
+def test_zarr_v3_create_classic_without_nodata_fill_value(tmp_vsimem):
+
+    with gdal.GetDriverByName("ZARR").Create(
+        tmp_vsimem / "test.zarr", 3, 2, 1, gdal.GDT_Int16, options=["FORMAT=ZARR_V3"]
+    ):
+        pass
+
+    with gdal.VSIFile(tmp_vsimem / "test.zarr" / "test" / "zarr.json", "rb") as f:
+        assert json.loads(f.read())["fill_value"] == 0
+
+    gdal.ErrorReset()
+    with gdal.Open(tmp_vsimem / "test.zarr") as ds:
+        assert gdal.GetLastErrorType() == gdal.CE_None, gdal.GetLastErrorMsg()
+        assert ds.GetRasterBand(1).GetNoDataValue() == 0
 
 
 @pytest.mark.parametrize(
@@ -7791,7 +7913,7 @@ def test_zarr_write_spatial_geotransform(tmp_vsimem):
                         "name": "default",
                         "configuration": {"separator": "/"},
                     },
-                    "fill_value": None,
+                    "fill_value": 0,
                     "codecs": [
                         {"name": "bytes", "configuration": {"endian": "little"}}
                     ],
@@ -7913,7 +8035,7 @@ def test_zarr_write_spatial_geotransform_no_epsg_code_rotated_gt_and_pixel_cente
                         "name": "default",
                         "configuration": {"separator": "/"},
                     },
-                    "fill_value": None,
+                    "fill_value": 0,
                     "codecs": [
                         {"name": "bytes", "configuration": {"endian": "little"}}
                     ],
