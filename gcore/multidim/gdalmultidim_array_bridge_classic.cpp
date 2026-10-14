@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: MIT
  ****************************************************************************/
 
+#include "gdal_cpp_functions.h"
 #include "gdal_multidim.h"
 #include "gdal_pam.h"
 #include "gdal_pam_multidim.h"
@@ -728,8 +729,7 @@ CPLErr GDALRasterBandFromArray::IWriteBlock(int nBlockXOff, int nBlockYOff,
 
 CPLErr GDALRasterBandFromArray::AdviseRead(int nXOff, int nYOff, int nXSize,
                                            int nYSize, int nBufXSize,
-                                           int nBufYSize,
-                                           GDALDataType /*eBufType*/,
+                                           int nBufYSize, GDALDataType eBufType,
                                            CSLConstList papszOptions)
 {
     auto l_poDS(cpl::down_cast<GDALDatasetFromArray *>(poDS));
@@ -739,6 +739,24 @@ CPLErr GDALRasterBandFromArray::AdviseRead(int nXOff, int nYOff, int nXSize,
         nBufXSize, nBufYSize, 1, &nBand);
     if (eErr != CE_None || bStopProcessing)
         return eErr;
+
+    // When downsampling, advise the overview that will serve the request
+    // rather than the full resolution array.
+    if ((nBufXSize < nXSize || nBufYSize < nYSize) && GetOverviewCount() > 0)
+    {
+        const int nOverview = GDALBandGetBestOverviewLevel2(
+            this, nXOff, nYOff, nXSize, nYSize, nBufXSize, nBufYSize, nullptr);
+        if (nOverview >= 0)
+        {
+            GDALRasterBand *poOverviewBand = GetOverview(nOverview);
+            if (poOverviewBand == nullptr)
+                return CE_Failure;
+
+            return poOverviewBand->AdviseRead(nXOff, nYOff, nXSize, nYSize,
+                                              nBufXSize, nBufYSize, eBufType,
+                                              papszOptions);
+        }
+    }
 
     const auto &poArray(l_poDS->m_poArray);
     std::vector<GUInt64> anArrayStartIdx = m_anOffset;
@@ -816,8 +834,27 @@ CPLErr GDALRasterBandFromArray::IRasterIO(GDALRWFlag eRWFlag, int nXOff,
     // Backends that don't override AdviseRead() return true (no-op).
     if (eRWFlag == GF_Read)
     {
-        AdviseRead(nXOff, nYOff, nXSize, nYSize, nBufXSize, nBufYSize, eBufType,
-                   nullptr);
+        // When downsampling, GDALRasterBand::IRasterIO() may redirect the
+        // request to an overview, whose own IRasterIO() advises its window.
+        bool bUseOverview = false;
+        if ((nBufXSize < nXSize || nBufYSize < nYSize) &&
+            GetOverviewCount() > 0)
+        {
+            int nXOffMod = nXOff;
+            int nYOffMod = nYOff;
+            int nXSizeMod = nXSize;
+            int nYSizeMod = nYSize;
+            GDALRasterIOExtraArg sExtraArg;
+            GDALCopyRasterIOExtraArg(&sExtraArg, psExtraArg);
+            bUseOverview = GDALBandGetBestOverviewLevel2(
+                               this, nXOffMod, nYOffMod, nXSizeMod, nYSizeMod,
+                               nBufXSize, nBufYSize, &sExtraArg) >= 0;
+        }
+        if (!bUseOverview)
+        {
+            AdviseRead(nXOff, nYOff, nXSize, nYSize, nBufXSize, nBufYSize,
+                       eBufType, nullptr);
+        }
     }
     return GDALRasterBand::IRasterIO(eRWFlag, nXOff, nYOff, nXSize, nYSize,
                                      pData, nBufXSize, nBufYSize, eBufType,

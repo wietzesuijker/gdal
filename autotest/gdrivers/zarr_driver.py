@@ -8844,6 +8844,46 @@ def test_zarr_build_overviews_classic_bridge(tmp_vsimem):
 
 
 ###############################################################################
+# Test that a downsampled read served by an overview does not advise a read of
+# the full resolution array (https://github.com/OSGeo/gdal/issues/15380)
+
+
+def test_zarr_downsampled_read_does_not_advise_full_resolution(tmp_vsimem):
+
+    path = tmp_vsimem / "test.zarr"
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        path, options=["FORMAT=ZARR_V3"]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 256)
+    dim_x = rg.CreateDimension("X", None, None, 256)
+    ar = rg.CreateMDArray(
+        "data",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=64,64"],
+    )
+    ar.Write(array.array("B", [i % 251 for i in range(256 * 256)]))
+    assert ar.BuildOverviews("NEAREST", [4]) == gdal.CE_None
+    ds.Close()
+
+    ds = gdal.Open(path)
+    # Opening the overview warns about its null fill_value
+    with gdal.quiet_errors():
+        expected = ds.GetRasterBand(1).GetOverview(0).ReadRaster()
+
+    # The implicit AdviseRead() cache size is half of the block cache: too
+    # small for the 64 KB full resolution array, large enough for the 4 KB
+    # overview
+    with gdaltest.SetCacheMax(100000), gdaltest.error_raised(gdal.CE_None):
+        assert ds.GetRasterBand(1).ReadRaster(buf_xsize=64, buf_ysize=64) == expected
+        # gdal_translate -outsize issues an AdviseRead() on the source
+        out_ds = gdal.Translate(tmp_vsimem / "out.tif", ds, width=64, height=64)
+        assert out_ds.ReadRaster() == expected
+
+
+###############################################################################
 # Test BuildOverviews coordinate arrays: regular (recalculated) and
 # irregular (subsampled) spacing in one test.
 
