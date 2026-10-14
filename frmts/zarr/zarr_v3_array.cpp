@@ -216,9 +216,14 @@ bool ZarrV3Array::Serialize(const CPLJSONObject &oAttrs)
     }
     else
     {
-        if (m_oType.GetNumericDataType() == GDT_CFloat16 ||
-            m_oType.GetNumericDataType() == GDT_CFloat32 ||
-            m_oType.GetNumericDataType() == GDT_CFloat64)
+        if (m_dtype.GetType() == CPLJSONObject::Type::String &&
+            m_dtype.ToString() == "bool")
+        {
+            oRoot.Add("fill_value", GetNoDataValueAsDouble() != 0);
+        }
+        else if (m_oType.GetNumericDataType() == GDT_CFloat16 ||
+                 m_oType.GetNumericDataType() == GDT_CFloat32 ||
+                 m_oType.GetNumericDataType() == GDT_CFloat64)
         {
             double adfNoDataValue[2];
             GDALCopyWords(m_pabyNoData, m_oType.GetNumericDataType(), 0,

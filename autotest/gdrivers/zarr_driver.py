@@ -2163,7 +2163,9 @@ def test_zarr_v3_create_array_without_nodata_fill_value(
             assert ar.GetNoDataValueAsRaw() == bytes(datatype.GetSize())
 
 
-def test_zarr_v3_delete_nodata_bool_fill_value(tmp_vsimem):
+@pytest.mark.parametrize("fill_value", [False, True])
+@pytest.mark.parametrize("operation", ["delete_nodata", "set_nodata", "set_unit"])
+def test_zarr_v3_update_bool_fill_value(tmp_vsimem, fill_value, operation):
 
     filename = tmp_vsimem / "test.zarr"
     metadata = {
@@ -2173,7 +2175,7 @@ def test_zarr_v3_delete_nodata_bool_fill_value(tmp_vsimem):
         "data_type": "bool",
         "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
         "chunk_key_encoding": {"name": "default"},
-        "fill_value": True,
+        "fill_value": fill_value,
         "codecs": [{"name": "bytes"}],
     }
     gdal.Mkdir(filename, 0)
@@ -2182,17 +2184,23 @@ def test_zarr_v3_delete_nodata_bool_fill_value(tmp_vsimem):
     with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
         rg = ds.GetRootGroup()
         ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
-        assert ar.GetNoDataValueAsDouble() == 1
-        assert ar.DeleteNoDataValue() == gdal.CE_None
+        assert ar.GetNoDataValueAsDouble() == int(fill_value)
+        if operation == "delete_nodata":
+            assert ar.DeleteNoDataValue() == gdal.CE_None
+        elif operation == "set_nodata":
+            assert ar.SetNoDataValueDouble(int(fill_value)) == gdal.CE_None
+        else:
+            assert ar.SetUnit("m") == gdal.CE_None
 
+    expected_fill_value = False if operation == "delete_nodata" else fill_value
     with gdal.VSIFile(filename / "zarr.json", "rb") as f:
-        assert json.loads(f.read())["fill_value"] is False
+        assert json.loads(f.read())["fill_value"] is expected_fill_value
 
     with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
         rg = ds.GetRootGroup()
         ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
-        assert ar.GetNoDataValueAsDouble() == 0
-        assert ar.Read() == bytes([0, 0])
+        assert ar.GetNoDataValueAsDouble() == int(expected_fill_value)
+        assert ar.Read() == bytes([int(expected_fill_value)] * 2)
 
 
 def test_zarr_v3_create_classic_without_nodata_fill_value(tmp_vsimem):
