@@ -72,6 +72,17 @@ class GDALRasterBandFromArray final : public GDALPamRasterBand
     double GetNoDataValue(int *pbHasNoData) override;
     int64_t GetNoDataValueAsInt64(int *pbHasNoData) override;
     uint64_t GetNoDataValueAsUInt64(int *pbHasNoData) override;
+    CPLErr SetNoDataValue(double dfNoData) override;
+    CPLErr SetNoDataValueAsInt64(int64_t nNoData) override;
+    CPLErr SetNoDataValueAsUInt64(uint64_t nNoData) override;
+    CPLErr DeleteNoDataValue() override;
+
+    int GetMaskFlags() override
+    {
+        GetMaskBand();
+        return GDALPamRasterBand::GetMaskFlags();
+    }
+
     double GetOffset(int *pbHasOffset) override;
     double GetScale(int *pbHasScale) override;
     const char *GetUnitType() override;
@@ -641,6 +652,50 @@ uint64_t GDALRasterBandFromArray::GetNoDataValueAsUInt64(int *pbHasNoData)
     if (pbHasNoData)
         *pbHasNoData = bHasNodata;
     return nodata;
+}
+
+/************************************************************************/
+/*                           SetNoDataValue()                           */
+/************************************************************************/
+
+CPLErr GDALRasterBandFromArray::SetNoDataValue(double dfNoData)
+{
+    const auto &poArray =
+        cpl::down_cast<GDALDatasetFromArray *>(poDS)->m_poArray;
+    return poArray->SetNoDataValue(dfNoData) ? CE_None : CE_Failure;
+}
+
+/************************************************************************/
+/*                       SetNoDataValueAsInt64()                        */
+/************************************************************************/
+
+CPLErr GDALRasterBandFromArray::SetNoDataValueAsInt64(int64_t nNoData)
+{
+    const auto &poArray =
+        cpl::down_cast<GDALDatasetFromArray *>(poDS)->m_poArray;
+    return poArray->SetNoDataValue(nNoData) ? CE_None : CE_Failure;
+}
+
+/************************************************************************/
+/*                       SetNoDataValueAsUInt64()                       */
+/************************************************************************/
+
+CPLErr GDALRasterBandFromArray::SetNoDataValueAsUInt64(uint64_t nNoData)
+{
+    const auto &poArray =
+        cpl::down_cast<GDALDatasetFromArray *>(poDS)->m_poArray;
+    return poArray->SetNoDataValue(nNoData) ? CE_None : CE_Failure;
+}
+
+/************************************************************************/
+/*                         DeleteNoDataValue()                          */
+/************************************************************************/
+
+CPLErr GDALRasterBandFromArray::DeleteNoDataValue()
+{
+    const auto &poArray =
+        cpl::down_cast<GDALDatasetFromArray *>(poDS)->m_poArray;
+    return poArray->SetRawNoDataValue(nullptr) ? CE_None : CE_Failure;
 }
 
 /************************************************************************/
