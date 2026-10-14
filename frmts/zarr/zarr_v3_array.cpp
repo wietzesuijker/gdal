@@ -616,11 +616,14 @@ bool ZarrV3Array::IRead(const GUInt64 *arrayStartIdx, const size_t *count,
 {
     // For sharded arrays, pre-populate the block cache via ReadMultiRange()
     // so that the base-class block-by-block loop hits memory, not HTTP.
-    if (m_poCodecs && m_poCodecs->SupportsPartialDecoding() &&
-        std::all_of(arrayStep, arrayStep + m_aoDims.size(),
-                    [](GInt64 nStep) { return nStep == 1; }))
+    if (m_poCodecs && m_poCodecs->SupportsPartialDecoding())
     {
-        if (!PreloadShardedBlocks(arrayStartIdx, count, GDALGetNumThreads()))
+        if (!CheckValidAndErrorOutIfNot() || !FlushDirtyBlock() ||
+            !FlushShardCache())
+            return false;
+        if (std::all_of(arrayStep, arrayStep + m_aoDims.size(),
+                        [](GInt64 nStep) { return nStep == 1; }) &&
+            !PreloadShardedBlocks(arrayStartIdx, count, GDALGetNumThreads()))
             return false;
     }
     return ZarrArray::IRead(arrayStartIdx, count, arrayStep, bufferStride,
@@ -635,7 +638,8 @@ bool ZarrV3Array::PreloadShardedBlocks(const GUInt64 *arrayStartIdx,
                                        const size_t *count,
                                        int nMaxThreads) const
 {
-    if (!CheckValidAndErrorOutIfNot() || !FlushDirtyBlock())
+    if (!CheckValidAndErrorOutIfNot() || !FlushDirtyBlock() ||
+        !FlushShardCache())
         return false;
 
     const size_t nDims = m_aoDims.size();
