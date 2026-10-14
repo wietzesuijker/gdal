@@ -4466,6 +4466,62 @@ def test_zarr_advise_read_corrupted_chunk_multithreaded(tmp_vsimem, format):
 
 
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+@pytest.mark.parametrize("corrupted", [False, True])
+@gdaltest.disable_exceptions()
+def test_zarr_advise_read_cache_after_incomplete_chunk(tmp_vsimem, format, corrupted):
+    """A failed prefetch must not mark its entire window as cached. Missing
+    chunks are valid fill-value chunks and can be cached normally."""
+
+    filename = tmp_vsimem / "test.zarr"
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    )
+    rg = ds.GetRootGroup()
+    dims = [rg.CreateDimension(name, None, None, 256) for name in ("Y", "X")]
+    ar = rg.CreateMDArray(
+        "test", dims, gdal.ExtendedDataType.Create(gdal.GDT_UInt8), ["BLOCKSIZE=16,16"]
+    )
+    ar.SetNoDataValueDouble(0)
+    expected = bytearray(i % 251 for i in range(256 * 256))
+    ar.Write(expected)
+    ds.Close()
+
+    # Corrupt the last chunk so that its worker has already cached chunks
+    # before reporting failure, independently of the thread scheduling.
+    chunk = filename / "test" / ("15.15" if format == "ZARR_V2" else "c/15/15")
+    f = gdal.VSIFOpenL(chunk, "rb")
+    chunk_data = gdal.VSIFReadL(1, 256, f)
+    gdal.VSIFCloseL(f)
+    if corrupted:
+        gdal.FileFromMemBuffer(chunk, b"corrupted")
+    else:
+        gdal.Unlink(chunk)
+        for y in range(240, 256):
+            expected[y * 256 + 240 : (y + 1) * 256] = bytes(16)
+
+    ds = gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE)
+    ar = ds.GetRootGroup().OpenMDArray("test")
+    with gdal.quiet_errors():
+        for _ in range(2):
+            assert ar.AdviseRead(options=["NUM_THREADS=4"]) == (
+                gdal.CE_Failure if corrupted else gdal.CE_None
+            )
+
+    if corrupted:
+        gdal.FileFromMemBuffer(chunk, chunk_data)
+        assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_None
+
+    # A successful retry (or a valid missing chunk) populates the cache.
+    gdal.Unlink(filename / "test" / ("0.0" if format == "ZARR_V2" else "c/0/0"))
+    assert ar.Read() == expected
+
+    ds.GetRootGroup().DeleteMDArray("test")
+    with gdal.quiet_errors():
+        assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+    assert "has been deleted" in gdal.GetLastErrorMsg()
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
 def test_zarr_advise_read_cache_preserved_by_unaligned_read(tmp_path, format):
     """The implicit AdviseRead() of an unaligned classic raster read does not
     discard the cache of a previous AdviseRead() covering it."""

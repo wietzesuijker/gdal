@@ -921,6 +921,10 @@ bool ZarrV2Array::IAdviseRead(const GUInt64 *arrayStartIdx, const size_t *count,
         wtp->WaitEvent();
     }
 
+    // A partial cache does not cover the whole requested window.
+    if (!bGlobalStatus)
+        m_anCachedAdviseReadStart.clear();
+
     return bGlobalStatus;
 }
 

@@ -954,7 +954,8 @@ bool ZarrArray::IsAdviseReadCached(const GUInt64 *arrayStartIdx,
                                    const GInt64 *arrayStep) const
 {
     const size_t nDims = m_aoDims.size();
-    if (m_oChunkCache.empty() || m_anCachedAdviseReadStart.size() != nDims)
+    if (!m_bValid || m_oChunkCache.empty() ||
+        m_anCachedAdviseReadStart.size() != nDims)
         return false;
     for (size_t i = 0; i < nDims; ++i)
     {
