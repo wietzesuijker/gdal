@@ -8958,6 +8958,57 @@ def test_zarr_downsampled_read_does_not_advise_full_resolution(tmp_vsimem):
 
 
 ###############################################################################
+# gdalwarp reads the source at full resolution, so its AdviseRead() must not
+# be redirected to an overview
+
+
+def test_zarr_warp_without_overviews_does_not_advise_overview(tmp_vsimem):
+
+    path = tmp_vsimem / "test.zarr"
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        path, options=["FORMAT=ZARR_V3"]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 256)
+    dim_x = rg.CreateDimension("X", None, None, 256)
+    ar = rg.CreateMDArray(
+        "data",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=64,64"],
+    )
+    ar.Write(array.array("B", [1 + i % 250 for i in range(256 * 256)]))
+    assert ar.BuildOverviews("NEAREST", [4]) == gdal.CE_None
+    ds.Close()
+
+    ds = gdal.Open(path)
+    # Opening the overview warns about its null fill_value
+    with gdal.quiet_errors():
+        ovr = ds.GetRasterBand(1).GetOverview(0)
+
+    with gdaltest.config_option("GDAL_NUM_THREADS", "2"):
+        out_ds = gdal.Warp(
+            "",
+            ds,
+            format="MEM",
+            width=64,
+            height=64,
+            overviewLevel="NONE",
+            transformerOptions=[
+                "SRC_METHOD=NO_GEOTRANSFORM",
+                "DST_METHOD=NO_GEOTRANSFORM",
+            ],
+        )
+    assert 0 not in out_ds.ReadRaster()
+
+    # Had the warp AdviseRead() prefetched the overview, its chunk would
+    # still be served from the AdviseRead() cache
+    gdal.Unlink(path / "ovr_4x" / "data" / "c" / "0" / "0")
+    assert ovr.ReadRaster() == b"\x00" * (64 * 64)
+
+
+###############################################################################
 # Test BuildOverviews coordinate arrays: regular (recalculated) and
 # irregular (subsampled) spacing in one test.
 
