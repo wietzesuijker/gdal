@@ -4709,6 +4709,108 @@ def test_zarr_resize(tmp_vsimem, format, create_z_metadata):
     check()
 
 
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+@pytest.mark.parametrize("array_type,fill_value", [("h", -7), ("f", "NaN")])
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ([2], [11, 12, None, None]),
+        ([2, 3], [11, 12, 13, None, 14, 15, 16, None] + [None] * 8),
+    ],
+)
+@pytest.mark.parametrize("read_first", [False, True])
+def test_zarr_resize_partial_chunk_fill_value(
+    tmp_path, format, array_type, fill_value, shape, expected, read_first
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    chunks = [4] * len(shape)
+    metadata = {"shape": shape, "fill_value": fill_value}
+    if format == "ZARR_V2":
+        metadata.update(
+            zarr_format=2,
+            chunks=chunks,
+            dtype="<i2" if array_type == "h" else "<f4",
+            order="C",
+            compressor=None,
+            filters=None,
+        )
+        metadata_filename = ".zarray"
+    else:
+        metadata.update(
+            zarr_format=3,
+            node_type="array",
+            data_type="int16" if array_type == "h" else "float32",
+            chunk_grid={"name": "regular", "configuration": {"chunk_shape": chunks}},
+            chunk_key_encoding={"name": "default"},
+            codecs=[{"name": "bytes", "configuration": {"endian": "little"}}],
+        )
+        metadata_filename = "zarr.json"
+    (filename / metadata_filename).write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        if read_first:
+            assert ar.Read() is not None
+        values = array.array(array_type, range(11, 11 + math.prod(shape)))
+        assert ar.Write(values) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Resize(chunks) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        actual = array.array(array_type, ar.Read())
+        assert len(actual) == len(expected)
+        for got, value in zip(actual, expected):
+            if value is None and fill_value == "NaN":
+                assert math.isnan(got)
+            else:
+                assert got == (fill_value if value is None else value)
+
+
+@pytest.mark.parametrize(
+    "data_type,codec",
+    [
+        ("string", "vlen-utf8"),
+        (
+            {"name": "null_terminated_bytes", "configuration": {"length_bytes": 8}},
+            "bytes",
+        ),
+    ],
+)
+@pytest.mark.parametrize("read_first", [False, True])
+def test_zarr_partial_string_chunk_padding_fill_value(
+    tmp_path, data_type, codec, read_first
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": "fill",
+        "codecs": [{"name": codec}],
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        if read_first:
+            assert ar.Read() == ["fill", "fill"]
+        assert ar.Write(["first", "second"]) == gdal.CE_None
+    metadata["shape"] = [4]
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == ["first", "second", "fill", "fill"]
+
+
 @pytest.mark.parametrize("create_z_metadata", [True, False])
 def test_zarr_resize_XARRAY(tmp_vsimem, create_z_metadata):
 
