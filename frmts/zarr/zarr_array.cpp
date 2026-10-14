@@ -1837,7 +1837,8 @@ lbl_next_depth:
         auto &abyBlock = m_abyDecodedBlockData.empty() ? m_abyRawBlockData
                                                        : m_abyDecodedBlockData;
 
-        if (!blockIndices.empty() && blockIndices == m_anCachedBlockIndices)
+        if (!blockIndices.empty() && blockIndices == m_anCachedBlockIndices &&
+            !m_bCachedBlockEmpty)
         {
             if (!m_bCachedBlockValid)
                 return false;

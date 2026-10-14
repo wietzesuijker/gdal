@@ -2534,7 +2534,8 @@ def test_zarr_v3_sharded_string_write_rejected(tmp_path):
                 ar.Write(["written"], array_start_idx=[0], count=[1]) == gdal.CE_Failure
             )
         assert (
-            "Writing sharded string arrays is not supported" in gdal.GetLastErrorMsg()
+            "Writing sharded variable-length string arrays is not supported"
+            in gdal.GetLastErrorMsg()
         )
         assert ar.Read() == [""] * 4
     assert (filename / "ar" / "zarr.json").read_bytes() == metadata
@@ -8705,6 +8706,140 @@ def test_zarr_v3_read_sharded_null_terminated_bytes():
     assert ar.GetDimensionCount() == 1
     assert ar.GetDimensions()[0].GetSize() == 4
     assert ar.Read() == ["hi", "bye", "foo", "bar"]
+
+
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+def test_zarr_partial_write_after_reading_missing_chunk(tmp_path, format):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    if format == "ZARR_V2":
+        metadata = {
+            "zarr_format": 2,
+            "shape": [4],
+            "dtype": "|i1",
+            "chunks": [4],
+            "order": "C",
+            "compressor": None,
+            "filters": None,
+            "fill_value": -7,
+        }
+        metadata_filename = ".zarray"
+    else:
+        metadata = {
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [4],
+            "data_type": "int8",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+            "chunk_key_encoding": {"name": "default"},
+            "fill_value": -7,
+            "codecs": [{"name": "bytes"}],
+        }
+        metadata_filename = "zarr.json"
+    (filename / metadata_filename).write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == bytes(array.array("b", [-7] * 4))
+        assert (
+            ar.Write(array.array("b", [11]), array_start_idx=[1], count=[1])
+            == gdal.CE_None
+        )
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == bytes(array.array("b", [-7, 11, -7, -7]))
+
+
+def test_zarr_v3_update_sharded_null_terminated_bytes(tmp_path):
+    filename = tmp_path / "test.zarr"
+    shutil.copytree("data/zarr/v3/sharded_null_terminated_bytes.zarr", filename)
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        ar = ds.GetRootGroup().OpenMDArray("ar")
+        assert ar.Read() == ["hi", "bye", "foo", "bar"]
+        assert ar.Write(["new"], array_start_idx=[0], count=[1]) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("ar").Read() == [
+            "new",
+            "bye",
+            "foo",
+            "bar",
+        ]
+
+
+@pytest.mark.parametrize(
+    "data_type,fill_value,initial_values",
+    [
+        ("null_terminated_bytes", "", ["hi", "bye"]),
+        ("null_terminated_bytes", "fill", ["hi", "bye"]),
+        ("null_terminated_bytes", "full!", ["hi", "bye"]),
+        ("fixed_length_utf32", "雪", ["甲", "乙"]),
+    ],
+)
+def test_zarr_v3_sharded_fixed_string_sparse_fill(
+    tmp_path, data_type, fill_value, initial_values
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    native_size = 5 if data_type == "null_terminated_bytes" else 12
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [8],
+        "data_type": {
+            "name": data_type,
+            "configuration": {"length_bytes": native_size},
+        },
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": fill_value,
+        "codecs": [
+            {
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [2],
+                    "codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}}
+                    ],
+                    "index_codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}}
+                    ],
+                    "index_location": "end",
+                },
+            }
+        ],
+    }
+    metadata_path = filename / "zarr.json"
+    metadata_path.write_text(json.dumps(metadata))
+    encoded_metadata = metadata_path.read_bytes()
+    # One populated inner chunk, one missing inner chunk, and one missing shard.
+    encoding = "ascii" if data_type == "null_terminated_bytes" else "utf-32-le"
+    payload = b"".join(
+        v.encode(encoding).ljust(native_size, b"\0") for v in initial_values
+    )
+    (filename / "c").mkdir()
+    (filename / "c" / "0").write_bytes(
+        payload + struct.pack("<QQQQ", 0, len(payload), 2**64 - 1, 2**64 - 1)
+    )
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == initial_values + [fill_value] * 6
+        assert ar.Write(["new"], array_start_idx=[0], count=[1]) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == ["new", initial_values[1]] + [fill_value] * 6
+        assert ar.Write(["end"], array_start_idx=[6], count=[1]) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.GetNoDataValueAsRaw() is None
+        assert ar.Read() == ["new", initial_values[1]] + [fill_value] * 4 + [
+            "end",
+            fill_value,
+        ]
+    assert metadata_path.read_bytes() == encoded_metadata
 
 
 ###############################################################################

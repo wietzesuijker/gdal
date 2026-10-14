@@ -1476,7 +1476,10 @@ bool ZarrV3Array::FlushDirtyBlockSharded() const
         }
         else
         {
-            if (std::all_of(m_abyFillValue.begin(), m_abyFillValue.end(),
+            std::vector<GByte> abyNativeFill(nSourceSize);
+            EncodeElt(m_aoDtypeElts, m_abyFillValue.data(),
+                      abyNativeFill.data());
+            if (std::all_of(abyNativeFill.begin(), abyNativeFill.end(),
                             [](GByte byValue) { return byValue == 0; }))
             {
                 memset(entry.abyShardBuffer.data(), 0,
@@ -1487,7 +1490,7 @@ bool ZarrV3Array::FlushDirtyBlockSharded() const
                 for (size_t i = 0; i < nShardElements; ++i)
                 {
                     memcpy(entry.abyShardBuffer.data() + i * nSourceSize,
-                           m_abyFillValue.data(), nSourceSize);
+                           abyNativeFill.data(), nSourceSize);
                 }
             }
         }
@@ -1919,11 +1922,13 @@ bool ZarrV3Array::IWrite(const GUInt64 *arrayStartIdx, const size_t *count,
                          const GDALExtendedDataType &bufferDataType,
                          const void *pSrcBuffer)
 {
-    if (m_oType.GetClass() == GEDTC_STRING && m_poCodecs &&
+    if (m_dtype.GetType() == CPLJSONObject::Type::String &&
+        m_dtype.ToString() == "string" && m_poCodecs &&
         m_poCodecs->SupportsPartialDecoding())
     {
-        CPLError(CE_Failure, CPLE_NotSupported,
-                 "Writing sharded string arrays is not supported");
+        CPLError(
+            CE_Failure, CPLE_NotSupported,
+            "Writing sharded variable-length string arrays is not supported");
         return false;
     }
 
@@ -3040,22 +3045,9 @@ CPLStringList ZarrV3Array::GetRawBlockInfoInfo() const
              (zarrDataType.nativeType == DtypeElt::NativeType::STRING_ASCII ||
               zarrDataType.nativeType == DtypeElt::NativeType::STRING_UNICODE))
     {
-        // Convert from GDAL representation (char* pointer) to native
-        // format (fixed-size null-padded buffer) for FillWithNoData()
-        char *pStr = nullptr;
-        memcpy(&pStr, abyNoData.data(), sizeof(pStr));
         oInputArrayMetadata.abyNoData.resize(zarrDataType.nativeSize, 0);
-        if (pStr &&
-            zarrDataType.nativeType == DtypeElt::NativeType::STRING_ASCII)
-        {
-            const size_t nCopy =
-                std::min(strlen(pStr), zarrDataType.nativeSize > 0
-                                           ? zarrDataType.nativeSize - 1
-                                           : static_cast<size_t>(0));
-            memcpy(oInputArrayMetadata.abyNoData.data(), pStr, nCopy);
-        }
-        // STRING_UNICODE non-empty fill would need UTF-8 to UCS4
-        // conversion; zero-fill is correct for the common "" case
+        EncodeElt({zarrDataType}, abyNoData.data(),
+                  oInputArrayMetadata.abyNoData.data());
     }
     else
     {
