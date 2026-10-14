@@ -1826,7 +1826,8 @@ lbl_next_depth:
         auto &abyBlock = m_abyDecodedBlockData.empty() ? m_abyRawBlockData
                                                        : m_abyDecodedBlockData;
 
-        if (!blockIndices.empty() && blockIndices == m_anCachedBlockIndices)
+        if (!blockIndices.empty() && blockIndices == m_anCachedBlockIndices &&
+            !m_bCachedBlockEmpty)
         {
             if (!m_bCachedBlockValid)
                 return false;
@@ -1883,8 +1884,12 @@ lbl_next_depth:
                         {
                             for (size_t i = 0; i < nElts; ++i)
                             {
-                                GDALExtendedDataType::CopyValue(
-                                    m_pabyNoData, m_oType, dstPtr, m_oType);
+                                if (m_abyDecodedBlockData.empty())
+                                    EncodeElt(m_aoDtypeElts, m_pabyNoData,
+                                              dstPtr);
+                                else
+                                    GDALExtendedDataType::CopyValue(
+                                        m_pabyNoData, m_oType, dstPtr, m_oType);
                                 dstPtr += nCacheDTSize;
                             }
                         }
