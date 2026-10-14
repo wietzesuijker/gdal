@@ -2140,7 +2140,11 @@ def test_zarr_v3_create_array_without_nodata_fill_value(
         if datatype.GetClass() == gdal.GEDTC_STRING:
             assert values == ["", ""]
         elif expected_fill_value == "NaN":
-            assert all(math.isnan(v) for v in ar.ReadAsArray())
+            values = struct.unpack(
+                "2d",
+                ar.Read(buffer_datatype=gdal.ExtendedDataType.Create(gdal.GDT_Float64)),
+            )
+            assert all(math.isnan(v) for v in values)
         else:
             assert values == bytes(2 * datatype.GetSize())
 
@@ -2276,7 +2280,7 @@ def test_zarr_v3_storage_fill_independent_of_nodata(tmp_path, sharded):
             "ar", [dim], gdal.ExtendedDataType.Create(gdal.GDT_Int16), array_options
         )
         assert ar.SetNoDataValueDouble(-9999) == gdal.CE_None
-        assert ar.ReadAsArray().tolist() == [0] * 8
+        assert ar.Read() == array.array("h", [0] * 8).tobytes()
         # Partial writes initialize the rest of the chunk/shard from storage fill.
         assert (
             ar.Write(array.array("h", [-9999, 0]), array_start_idx=[0], count=[2])
@@ -2292,7 +2296,7 @@ def test_zarr_v3_storage_fill_independent_of_nodata(tmp_path, sharded):
         with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
             ar = ds.GetRootGroup().OpenMDArray("ar")
             assert ar.GetNoDataValueAsDouble() == nodata
-            assert ar.ReadAsArray().tolist() == [-9999] + [0] * 7
+            assert ar.Read() == array.array("h", [-9999] + [0] * 7).tobytes()
         j = json.loads((filename / "ar" / "zarr.json").read_text())
         assert j["fill_value"] == 0
         if nodata is None:
@@ -2306,7 +2310,7 @@ def test_zarr_v3_storage_fill_independent_of_nodata(tmp_path, sharded):
     with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
         ar = ds.GetRootGroup().OpenMDArray("ar")
         assert ar.GetNoDataValueAsRaw() is None
-        assert ar.ReadAsArray().tolist() == [-9999] + [0] * 11
+        assert ar.Read() == array.array("h", [-9999] + [0] * 11).tobytes()
 
 
 @pytest.mark.parametrize(
