@@ -4433,6 +4433,38 @@ def test_zarr_advise_read_cache_preserved(tmp_path, format):
     assert got == expected
 
 
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+def test_zarr_advise_read_corrupted_chunk_multithreaded(tmp_vsimem, format):
+    """IAdviseRead returns an error instead of hanging when a chunk fails to
+    load while other threads still have chunks to process."""
+
+    filename = tmp_vsimem / "test.zarr"
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 256)
+    dim_x = rg.CreateDimension("X", None, None, 256)
+    ar = rg.CreateMDArray(
+        "test",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=16,16"],
+    )
+    ar.Write(array.array("B", [(i % 256) for i in range(256 * 256)]))
+    ds = None
+
+    chunk = filename / "test" / ("0.0" if format == "ZARR_V2" else "c/0/0")
+    assert gdal.VSIStatL(chunk) is not None
+    gdal.FileFromMemBuffer(chunk, b"corrupted")
+
+    ds = gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER)
+    ar = ds.GetRootGroup().OpenMDArray("test")
+    with gdal.quiet_errors():
+        assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
+
+
 def test_zarr_read_invalid_nczarr_dim(tmp_vsimem):
 
     gdal.Mkdir(tmp_vsimem / "test.zarr", 0)

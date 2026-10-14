@@ -928,7 +928,7 @@ bool ZarrV3Array::IAdviseRead(const GUInt64 *arrayStartIdx, const size_t *count,
             {
                 std::lock_guard<std::mutex> oLock(poArray->m_oMutex);
                 if (!(*jobStruct->pbGlobalStatus))
-                    return;
+                    break;
             }
 
             const uint64_t *blockIndices =
