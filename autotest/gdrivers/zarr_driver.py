@@ -6121,8 +6121,9 @@ def test_zarr_read_imagecodecs_tiff_errors(dirname):
 
 @gdaltest.enable_exceptions()
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
-def test_zarr_write_error_at_close_on_group(tmp_path, format):
-    out_filename = tmp_path / "test.zarr"
+def test_zarr_write_error_at_close_on_group(tmp_path, format, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out_filename = "test.zarr"
 
     ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
         out_filename, options=["FORMAT=" + format]
@@ -6149,8 +6150,9 @@ def test_zarr_write_error_at_close_on_group(tmp_path, format):
 
 @gdaltest.enable_exceptions()
 @pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
-def test_zarr_write_error_at_close_on_array(tmp_path, format):
-    out_filename = tmp_path / "test.zarr"
+def test_zarr_write_error_at_close_on_array(tmp_path, format, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out_filename = "test.zarr"
 
     ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
         out_filename, options=["FORMAT=" + format]
