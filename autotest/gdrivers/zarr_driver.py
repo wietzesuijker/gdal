@@ -4465,6 +4465,48 @@ def test_zarr_advise_read_corrupted_chunk_multithreaded(tmp_vsimem, format):
         assert ar.AdviseRead(options=["NUM_THREADS=4"]) == gdal.CE_Failure
 
 
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+def test_zarr_advise_read_cache_preserved_by_unaligned_read(tmp_path, format):
+    """The implicit AdviseRead() of an unaligned classic raster read does not
+    discard the cache of a previous AdviseRead() covering it."""
+
+    filename = str(tmp_path / "test.zarr")
+
+    ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+        filename, options=["FORMAT=" + format]
+    )
+    rg = ds.GetRootGroup()
+    dim_y = rg.CreateDimension("Y", None, None, 60)
+    dim_x = rg.CreateDimension("X", None, None, 80)
+    ar = rg.CreateMDArray(
+        "test",
+        [dim_y, dim_x],
+        gdal.ExtendedDataType.Create(gdal.GDT_UInt8),
+        ["BLOCKSIZE=20,20"],
+    )
+    ar.Write(array.array("B", [(i % 256) for i in range(60 * 80)]))
+    ds = None
+
+    ds = gdal.Open(filename)
+    expected = ds.ReadRaster(5, 5, 50, 40)
+    ds = None
+
+    with gdal.config_option("GDAL_NUM_THREADS", "ALL_CPUS"):
+        ds = gdal.Open(filename)
+        ds.GetRasterBand(1).AdviseRead(0, 0, 80, 60)
+
+        # Delete chunk files - Read must succeed from cache
+        for p in tmp_path.rglob("*"):
+            if (
+                p.is_file()
+                and p.suffix not in (".json",)
+                and not p.name.startswith(".z")
+            ):
+                p.unlink()
+
+        assert ds.ReadRaster(5, 5, 50, 40) == expected
+
+
 def test_zarr_read_invalid_nczarr_dim(tmp_vsimem):
 
     gdal.Mkdir(tmp_vsimem / "test.zarr", 0)

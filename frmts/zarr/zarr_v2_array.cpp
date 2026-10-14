@@ -766,6 +766,12 @@ bool ZarrV2Array::LoadBlockData(const uint64_t *blockIndices, bool bUseMutex,
 bool ZarrV2Array::IAdviseRead(const GUInt64 *arrayStartIdx, const size_t *count,
                               CSLConstList papszOptions) const
 {
+    // The chunk cache already holds the requested region, for example when
+    // GDALRasterBandFromArray::IRasterIO() advises a window of a previous
+    // AdviseRead() on the whole raster
+    if (IsAdviseReadCached(arrayStartIdx, count, nullptr))
+        return true;
+
     std::vector<uint64_t> anIndicesCur;
     int nThreadsMax = 0;
     std::vector<uint64_t> anReqBlocksIndices;

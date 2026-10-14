@@ -1064,6 +1064,9 @@ class ZarrArray CPL_NON_FINAL : public GDALPamMDArray
 
     bool IsEmptyBlock(const ZarrByteVectorQuickResize &abyBlock) const;
 
+    bool IsAdviseReadCached(const GUInt64 *arrayStartIdx, const size_t *count,
+                            const GInt64 *arrayStep) const;
+
     bool IAdviseReadCommon(const GUInt64 *arrayStartIdx, const size_t *count,
                            CSLConstList papszOptions,
                            std::vector<uint64_t> &anIndicesCur,

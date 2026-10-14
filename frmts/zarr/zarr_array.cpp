@@ -943,6 +943,37 @@ void ZarrArray::DecodeSourceElt(const std::vector<DtypeElt> &elts,
 }
 
 /************************************************************************/
+/*                   ZarrArray::IsAdviseReadCached()                    */
+/************************************************************************/
+
+// Whether the region is covered by the window of the last IAdviseRead()
+// that populated the chunk cache. arrayStep may be null (contiguous region),
+// otherwise its values must be positive.
+bool ZarrArray::IsAdviseReadCached(const GUInt64 *arrayStartIdx,
+                                   const size_t *count,
+                                   const GInt64 *arrayStep) const
+{
+    const size_t nDims = m_aoDims.size();
+    if (m_oChunkCache.empty() || m_anCachedAdviseReadStart.size() != nDims)
+        return false;
+    for (size_t i = 0; i < nDims; ++i)
+    {
+        const GUInt64 reqEnd =
+            arrayStartIdx[i] +
+            (count[i] - 1) *
+                (arrayStep ? static_cast<uint64_t>(arrayStep[i]) : 1);
+        const GUInt64 cachedEnd =
+            m_anCachedAdviseReadStart[i] + m_anCachedAdviseReadCount[i] - 1;
+        if (arrayStartIdx[i] < m_anCachedAdviseReadStart[i] ||
+            reqEnd > cachedEnd)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/************************************************************************/
 /*                    ZarrArray::IAdviseReadCommon()                    */
 /************************************************************************/
 
@@ -1182,26 +1213,7 @@ bool ZarrArray::IRead(const GUInt64 *arrayStartIdx, const size_t *count,
     // IAdviseRead (explicit or auto), so we don't blow away a useful cache.
     if (nDims >= 2)
     {
-        bool bAlreadyCached = false;
-        if (!m_oChunkCache.empty() && m_anCachedAdviseReadStart.size() == nDims)
-        {
-            bAlreadyCached = true;
-            for (size_t i = 0; i < nDims && bAlreadyCached; ++i)
-            {
-                const GUInt64 reqEnd =
-                    arrayStartIdx[i] +
-                    (count[i] - 1) * static_cast<uint64_t>(arrayStep[i]);
-                const GUInt64 cachedEnd = m_anCachedAdviseReadStart[i] +
-                                          m_anCachedAdviseReadCount[i] - 1;
-                if (arrayStartIdx[i] < m_anCachedAdviseReadStart[i] ||
-                    reqEnd > cachedEnd)
-                {
-                    bAlreadyCached = false;
-                }
-            }
-        }
-
-        if (!bAlreadyCached)
+        if (!IsAdviseReadCached(arrayStartIdx, count, arrayStep))
         {
             const char *pszNumThreads =
                 CPLGetConfigOption("GDAL_NUM_THREADS", nullptr);
