@@ -79,7 +79,7 @@ the correct driver to open the Zarr store:
 - :file:`.zarray`
 
 Fill values and nodata
----------------------
+----------------------
 
 For Zarr V3, ``fill_value`` defines the value read from unwritten chunks. It does not imply that this value is nodata. GDAL uses the optional ``_FillValue`` attribute to identify nodata, following the `Xarray Zarr encoding convention <https://docs.xarray.dev/en/stable/internals/zarr-encoding-spec.html>`__. Arrays without this attribute have no nodata value, so zero remains valid data. GDAL-created arrays use zero as the storage fill for integer and complex types, an empty string for strings, and NaN for floating point types.
 
