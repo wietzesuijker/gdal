@@ -663,6 +663,40 @@ def test_multidim_getgridded():
     )
 
 
+@pytest.mark.parametrize(
+    "datatype,setter,nodata",
+    [
+        (gdal.GDT_Float64, "SetNoDataValue", -9999),
+        (gdal.GDT_Int64, "SetNoDataValueAsInt64", -(2**63)),
+        (gdal.GDT_UInt64, "SetNoDataValueAsUInt64", 2**64 - 1),
+    ],
+)
+def test_multidim_asclassicdataset_nodata_updates(datatype, setter, nodata):
+    with gdal.GetDriverByName("MEM").CreateMultiDimensional("test") as ds:
+        rg = ds.GetRootGroup()
+        dims = [rg.CreateDimension(name, None, None, 2) for name in ("band", "y", "x")]
+        ar = rg.CreateMDArray("ar", dims, gdal.ExtendedDataType.Create(datatype))
+        classic = ar.AsClassicDataset(2, 1)
+        first, second = classic.GetRasterBand(1), classic.GetRasterBand(2)
+        assert first.GetNoDataValue() is None
+        assert first.GetMaskBand().ReadRaster() == bytes([255] * 4)
+        assert second.GetMaskBand().ReadRaster() == bytes([255] * 4)
+        assert getattr(first, setter)(0) == gdal.CE_None
+        assert first.GetNoDataValue() == 0
+        assert second.GetNoDataValue() == 0
+        assert first.GetMaskBand().ReadRaster() == bytes(4)
+        assert second.GetMaskBand().ReadRaster() == bytes(4)
+        assert getattr(second, setter)(nodata) == gdal.CE_None
+        assert first.GetNoDataValue() == nodata
+        assert second.GetNoDataValue() == nodata
+        assert first.GetMaskBand().ReadRaster() == bytes([255] * 4)
+        assert first.DeleteNoDataValue() == gdal.CE_None
+        assert first.GetNoDataValue() is None
+        assert second.GetNoDataValue() is None
+        assert ar.GetNoDataValueAsRaw() is None
+        assert first.GetMaskBand().ReadRaster() == bytes([255] * 4)
+
+
 @gdaltest.enable_exceptions()
 def test_multidim_asclassicdataset_single_dim():
 
