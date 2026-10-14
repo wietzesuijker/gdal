@@ -685,6 +685,88 @@ def test_multidim_asclassicdataset_single_dim():
         ar.AsClassicDataset(1, 0)
 
 
+@pytest.mark.parametrize("layout", ["YX", "BYX", "YXB"])
+@pytest.mark.parametrize("write_api", ["band", "dataset"])
+@pytest.mark.parametrize("read_api", ["band", "dataset"])
+@pytest.mark.parametrize("cached", ["partial_write", "clean_read", "dirty_write"])
+def test_multidim_asclassicdataset_read_write_coherence(
+    layout, write_api, read_api, cached
+):
+    with gdal.GetDriverByName("MEM").CreateMultiDimensional("") as ds:
+        rg = ds.GetRootGroup()
+        sizes = {"Y": 8, "X": 8, "B": 2}
+        dims = [rg.CreateDimension(name, None, None, sizes[name]) for name in layout]
+        ar = rg.CreateMDArray("ar", dims, gdal.ExtendedDataType.Create(gdal.GDT_Byte))
+        bands = 1 if layout == "YX" else 2
+        assert ar.Write(bytes([3] * (64 * bands))) == gdal.CE_None
+        classic = ar.AsClassicDataset(layout.index("X"), layout.index("Y"))
+        band = classic.GetRasterBand(1)
+        writer = band if write_api == "band" else classic
+        reader = band if read_api == "band" else classic
+        written_bands = 1 if write_api == "band" else bands
+        read_bands = 1 if read_api == "band" else bands
+        if cached == "clean_read":
+            assert reader.ReadRaster(1, 1, 1, 1) == bytes([3] * read_bands)
+        else:
+            assert (
+                writer.WriteRaster(1, 1, 1, 1, bytes([7] * written_bands))
+                == gdal.CE_None
+            )
+        if cached == "partial_write":
+            expected = bytearray([3] * (64 * read_bands))
+            for i in range(min(written_bands, read_bands)):
+                expected[i * 64 + 9] = 7
+            assert reader.ReadRaster() == expected
+        else:
+            assert (
+                writer.WriteRaster(0, 0, 8, 8, bytes([9] * (64 * written_bands)))
+                == gdal.CE_None
+            )
+            assert reader.ReadRaster(1, 1, 1, 1) == bytes(
+                [9 if i < written_bands else 3 for i in range(read_bands)]
+            )
+            assert classic.FlushCache() == gdal.CE_None
+            expected_bands = [
+                bytes([9 if i < written_bands else 3] * 64) for i in range(bands)
+            ]
+            expected = (
+                bytes(value for pixel in zip(*expected_bands) for value in pixel)
+                if layout == "YXB"
+                else b"".join(expected_bands)
+            )
+            assert ar.Read() == expected
+        band = classic = ar = rg = dims = None
+
+
+@pytest.mark.parametrize("api", ["band", "dataset"])
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_multidim_asclassicdataset_read_write_cache_window(api, operation):
+    with gdal.GetDriverByName("MEM").CreateMultiDimensional("") as ds:
+        rg = ds.GetRootGroup()
+        dims = [
+            rg.CreateDimension(name, None, None, size)
+            for name, size in [("B", 2), ("Y", 8), ("X", 8)]
+        ]
+        ar = rg.CreateMDArray("ar", dims, gdal.ExtendedDataType.Create(gdal.GDT_Byte))
+        assert ar.Write(bytes([3] * 128)) == gdal.CE_None
+        classic = ar.AsClassicDataset(2, 1)
+        band = classic.GetRasterBand(1)
+        assert band.WriteRaster(1, 5, 1, 1, bytes([7])) == gdal.CE_None
+        obj = band if api == "band" else classic
+        bands = 1 if api == "band" else 2
+        if operation == "read":
+            assert obj.ReadRaster(0, 0, 8, 2) == bytes([3] * (16 * bands))
+        else:
+            assert (
+                obj.WriteRaster(0, 0, 8, 2, bytes([9] * (16 * bands))) == gdal.CE_None
+            )
+        assert ar.Read(array_start_idx=[0, 5, 1], count=[1, 1, 1]) == bytes([3])
+        assert band.ReadRaster(1, 5, 1, 1) == bytes([7])
+        assert classic.FlushCache() == gdal.CE_None
+        assert ar.Read(array_start_idx=[0, 5, 1], count=[1, 1, 1]) == bytes([7])
+        band = classic = ar = rg = dims = None
+
+
 @gdaltest.enable_exceptions()
 def test_multidim_asclassicdataset_band_metadata():
 
