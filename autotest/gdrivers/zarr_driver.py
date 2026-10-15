@@ -8859,86 +8859,36 @@ def test_zarr_v3_resize_preserves_attributes(tmp_path):
 
 @pytest.mark.parametrize("has_chunk", [False, True])
 @pytest.mark.parametrize(
-    "type_name,length_bytes,encoding,value,fill_value",
+    "type_name,value,fill_value",
     [
-        ("null_terminated_bytes", 8, "ascii", "abcdefg", ""),
-        ("fixed_length_utf32", 16, "utf-32-le", "é水😀", ""),
-        ("fixed_length_utf32", 16, "utf-32-le", "é水😀", "f"),
+        ("null_terminated_bytes", "abcdefg", ""),
+        ("fixed_length_utf32", "é水😀", ""),
+        ("fixed_length_utf32", "é水😀", "f"),
+        ("null_terminated_bytes", "abc", ""),
+        ("null_terminated_bytes", "abc", "f"),
+        ("null_terminated_bytes", "abc", "Zg=="),
+        ("null_terminated_bytes", "abc", "é"),
+        ("fixed_length_utf32", "abc", "f"),
+        ("string", "abc", "Zg=="),
     ],
 )
-def test_zarr_v3_resize_fixed_length_string_dtype(
-    tmp_path, type_name, length_bytes, encoding, value, fill_value, has_chunk
+def test_zarr_v3_string_fill_roundtrip(
+    tmp_path, type_name, value, fill_value, has_chunk
 ):
-    filename = tmp_path / "test.zarr"
-    filename.mkdir()
-    data_type = {"name": type_name, "configuration": {"length_bytes": length_bytes}}
-    metadata = {
-        "zarr_format": 3,
-        "node_type": "array",
-        "shape": [2],
-        "data_type": data_type,
-        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
-        "chunk_key_encoding": {"name": "default"},
-        "fill_value": fill_value,
-        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
-        "attributes": {"description": "keep"},
-    }
-    (filename / "zarr.json").write_text(json.dumps(metadata))
-    chunk = bytes(length_bytes) + value.encode(encoding).ljust(length_bytes, b"\0")
-    if has_chunk:
-        (filename / "c").mkdir()
-        (filename / "c/0").write_bytes(chunk)
-    expected = ["", value] if has_chunk else [fill_value] * 2
-
-    for size in (4, 5):
-        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
-            rg = ds.GetRootGroup()
-            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
-            assert ar.Read() == expected
-            assert ar.Resize([size]) == gdal.CE_None
-            ar = rg = None
-
-        rewritten = json.loads((filename / "zarr.json").read_text())
-        assert rewritten["data_type"] == data_type
-        assert rewritten["shape"] == [size]
-        assert rewritten["fill_value"] == fill_value
-        assert rewritten["codecs"] == metadata["codecs"]
-        assert rewritten["attributes"] == metadata["attributes"]
-        if has_chunk:
-            assert (filename / "c/0").read_bytes() == chunk
-        expected += [fill_value] * (size - len(expected))
-        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
-            rg = ds.GetRootGroup()
-            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
-            assert ar.Read() == expected
-            ar = rg = None
-
-
-@pytest.mark.parametrize("has_chunk", [False, True])
-@pytest.mark.parametrize(
-    "type_name,fill_value",
-    [
-        ("null_terminated_bytes", ""),
-        ("null_terminated_bytes", "f"),
-        ("null_terminated_bytes", "Zg=="),
-        ("null_terminated_bytes", "é"),
-        ("fixed_length_utf32", "f"),
-        ("string", "Zg=="),
-    ],
-)
-def test_zarr_v3_string_fill_roundtrip(tmp_path, type_name, fill_value, has_chunk):
     filename = tmp_path / "test.zarr"
     filename.mkdir()
     if type_name == "string":
         data_type = type_name
         codecs = [{"name": "vlen-utf8"}]
-        chunk = struct.pack("<III", 2, 0, 3) + b"abc"
+        chunk = struct.pack("<III", 2, 0, len(value.encode("utf-8"))) + value.encode(
+            "utf-8"
+        )
     else:
         length_bytes = 8 if type_name == "null_terminated_bytes" else 16
         data_type = {"name": type_name, "configuration": {"length_bytes": length_bytes}}
         codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
         encoding = "ascii" if type_name == "null_terminated_bytes" else "utf-32-le"
-        chunk = bytes(length_bytes) + "abc".encode(encoding).ljust(length_bytes, b"\0")
+        chunk = bytes(length_bytes) + value.encode(encoding).ljust(length_bytes, b"\0")
     encoded_fill = (
         base64.b64encode(fill_value.encode("utf-8")).decode("ascii")
         if type_name == "null_terminated_bytes"
@@ -8959,7 +8909,7 @@ def test_zarr_v3_string_fill_roundtrip(tmp_path, type_name, fill_value, has_chun
     if has_chunk:
         (filename / "c").mkdir()
         (filename / "c/0").write_bytes(chunk)
-    expected = ["", "abc"] if has_chunk else [fill_value] * 2
+    expected = ["", value] if has_chunk else [fill_value] * 2
     for size in (4, 5):
         with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
             rg = ds.GetRootGroup()
@@ -8969,10 +8919,16 @@ def test_zarr_v3_string_fill_roundtrip(tmp_path, type_name, fill_value, has_chun
             ar = rg = None
         expected += [fill_value] * (size - len(expected))
         rewritten = json.loads((filename / "zarr.json").read_text())
+        assert rewritten["shape"] == [size]
         for key in ("data_type", "fill_value", "codecs", "attributes"):
             assert rewritten[key] == metadata[key]
         if has_chunk:
             assert (filename / "c/0").read_bytes() == chunk
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            ar = rg = None
 
     if has_chunk:
         with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
@@ -9406,9 +9362,14 @@ def test_zarr_write_sharded_read_same_handle(
         assert ds.GetRootGroup().OpenMDArray("data").Read() == expected
 
 
-@pytest.mark.parametrize("advise_read", [False, True])
-@pytest.mark.parametrize("num_threads", [1, 2])
-def test_zarr_write_sharded_read_flush_failure(tmp_path, advise_read, num_threads):
+@pytest.mark.parametrize("num_threads", [None, "1", "2"])
+@pytest.mark.parametrize(
+    "step,advise_read",
+    [(None, False), (None, True), (2, False), (-1, False), (-2, False)],
+)
+def test_zarr_write_sharded_read_flush_failure(
+    tmp_path, num_threads, step, advise_read
+):
     filename = tmp_path / "out.zarr"
     ds, ar = _create_sharded_array(
         filename,
@@ -9424,7 +9385,21 @@ def test_zarr_write_sharded_read_flush_failure(tmp_path, advise_read, num_thread
 
     shard = filename / "data/c/0/0"
     mode = shard.stat().st_mode
-    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+    start = 1 if step is None else 2
+    advise_options = [f"NUM_THREADS={num_threads}"] if num_threads else []
+    read_options = {}
+    if step is not None:
+        indices = list(
+            range(
+                0 if step > 0 else 7 if step == -1 else 6, 8 if step > 0 else -1, step
+            )
+        )
+        read_options = dict(
+            array_start_idx=[indices[0]] * 2,
+            count=[len(indices)] * 2,
+            array_step=[step] * 2,
+        )
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
         with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
             ar = ds.GetRootGroup().OpenMDArray("data")
             try:
@@ -9432,27 +9407,24 @@ def test_zarr_write_sharded_read_flush_failure(tmp_path, advise_read, num_thread
                 if os.access(shard, os.W_OK):
                     pytest.skip("cannot make shard read-only")
                 assert (
-                    ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                    ar.Write(bytes([7]), array_start_idx=[start, start], count=[1, 1])
                     == gdal.CE_None
                 )
                 with gdaltest.error_raised(
                     gdal.CE_Failure, match="Cannot create shard file"
                 ):
                     if advise_read:
-                        assert (
-                            ar.AdviseRead(options=[f"NUM_THREADS={num_threads}"])
-                            == gdal.CE_Failure
-                        )
+                        assert ar.AdviseRead(options=advise_options) == gdal.CE_Failure
                     else:
-                        assert ar.Read() is None
+                        assert ar.Read(**read_options) is None
             finally:
                 shard.chmod(mode)
             assert (
-                ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                ar.Write(bytes([7]), array_start_idx=[start, start], count=[1, 1])
                 == gdal.CE_None
             )
             expected = bytearray([3] * 64)
-            expected[9] = 7
+            expected[start * 8 + start] = 7
             assert ar.Read() == expected
             ar = None
 
@@ -9509,61 +9481,6 @@ def test_zarr_write_sharded_strided_read_same_handle(
                     )
                     == expected
                 )
-            ar = None
-
-
-@pytest.mark.parametrize("num_threads", [None, "2"])
-@pytest.mark.parametrize("step", [2, -1, -2])
-def test_zarr_write_sharded_strided_read_flush_failure(tmp_path, num_threads, step):
-    filename = tmp_path / "out.zarr"
-    ds, ar = _create_sharded_array(
-        filename,
-        [("y", 8), ("x", 8)],
-        [4, 4],
-        [2, 2],
-        gdal.GDT_UInt8,
-    )
-    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
-    assert ar.Write(bytes([3] * 64)) == gdal.CE_None
-    ar = None
-    ds.Close()
-
-    shard = filename / "data/c/0/0"
-    mode = shard.stat().st_mode
-    indices = list(
-        range(0 if step > 0 else 7 if step == -1 else 6, 8 if step > 0 else -1, step)
-    )
-    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
-        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
-            ar = ds.GetRootGroup().OpenMDArray("data")
-            try:
-                shard.chmod(0o444)
-                if os.access(shard, os.W_OK):
-                    pytest.skip("cannot make shard read-only")
-                assert (
-                    ar.Write(bytes([7]), array_start_idx=[2, 2], count=[1, 1])
-                    == gdal.CE_None
-                )
-                with gdaltest.error_raised(
-                    gdal.CE_Failure, match="Cannot create shard file"
-                ):
-                    assert (
-                        ar.Read(
-                            array_start_idx=[indices[0]] * 2,
-                            count=[len(indices)] * 2,
-                            array_step=[step] * 2,
-                        )
-                        is None
-                    )
-            finally:
-                shard.chmod(mode)
-            assert (
-                ar.Write(bytes([7]), array_start_idx=[2, 2], count=[1, 1])
-                == gdal.CE_None
-            )
-            expected = bytearray([3] * 64)
-            expected[18] = 7
-            assert ar.Read() == expected
             ar = None
 
 
