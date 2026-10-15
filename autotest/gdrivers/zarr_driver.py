@@ -9047,6 +9047,47 @@ def test_zarr_v3_s8_fill_null_bytes(tmp_path, native_fill, has_chunk):
 # Test Zarr v3 sharded fixed-length string array
 
 
+@pytest.mark.parametrize(
+    "type_name,length_bytes,fill_value",
+    [
+        ("null_terminated_bytes", 5, "fill"),
+        ("null_terminated_bytes", 16, "fill"),
+        ("fixed_length_utf32", 16, "水"),
+    ],
+)
+def test_zarr_write_sharded_string_fill(tmp_path, type_name, length_bytes, fill_value):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    with open("data/zarr/v3/sharded_null_terminated_bytes.zarr/ar/zarr.json") as f:
+        metadata = json.load(f)
+    metadata["data_type"] = {
+        "name": type_name,
+        "configuration": {"length_bytes": length_bytes},
+    }
+    metadata["fill_value"] = (
+        base64.b64encode(fill_value.encode()).decode()
+        if type_name == "null_terminated_bytes"
+        else fill_value
+    )
+    metadata["codecs"][0]["configuration"]["codecs"][0]["configuration"] = {
+        "endian": "little"
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    expected = ["new", fill_value, "last", fill_value]
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == [fill_value] * 4
+        for index, value in ((0, "new"), (2, "last")):
+            assert ar.Write([value], array_start_idx=[index], count=[1]) == gdal.CE_None
+        assert ar.Read() == expected
+        ar = rg = None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        assert rg.OpenMDArray(rg.GetMDArrayNames()[0]).Read() == expected
+        rg = None
+
+
 def test_zarr_v3_read_sharded_null_terminated_bytes():
 
     filename = "data/zarr/v3/sharded_null_terminated_bytes.zarr"

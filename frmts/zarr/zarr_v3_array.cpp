@@ -1347,10 +1347,12 @@ bool ZarrV3Array::FlushDirtyBlockSharded() const
             }
             else
             {
-                for (size_t i = 0; i < nShardElements; ++i)
+                EncodeElt(m_aoDtypeElts, m_pabyNoData,
+                          entry.abyShardBuffer.data());
+                for (size_t i = 1; i < nShardElements; ++i)
                 {
                     memcpy(entry.abyShardBuffer.data() + i * nSourceSize,
-                           m_pabyNoData, nSourceSize);
+                           entry.abyShardBuffer.data(), nSourceSize);
                 }
             }
         }
