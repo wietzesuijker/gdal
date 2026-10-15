@@ -61,6 +61,7 @@ template <class T> inline T MultiplyElements(const std::vector<T> &vector)
 
 class ZarrArray;
 class ZarrGroupBase;
+class CPLErrorAccumulator;
 
 class ZarrDataset final : public GDALDataset
 {
@@ -1064,6 +1065,9 @@ class ZarrArray CPL_NON_FINAL : public GDALPamMDArray
 
     bool IsEmptyBlock(const ZarrByteVectorQuickResize &abyBlock) const;
 
+    bool IsAdviseReadCached(const GUInt64 *arrayStartIdx, const size_t *count,
+                            const GInt64 *arrayStep) const;
+
     bool IAdviseReadCommon(const GUInt64 *arrayStartIdx, const size_t *count,
                            CSLConstList papszOptions,
                            std::vector<uint64_t> &anIndicesCur,
@@ -1445,8 +1449,8 @@ class ZarrV3Array final : public ZarrArray
                const GDALExtendedDataType &bufferDataType,
                void *pDstBuffer) const override;
 
-    void PreloadShardedBlocks(const GUInt64 *arrayStartIdx,
-                              const size_t *count) const;
+    bool PreloadShardedBlocks(const GUInt64 *arrayStartIdx, const size_t *count,
+                              int nMaxThreads) const;
 
     bool IWrite(const GUInt64 *arrayStartIdx, const size_t *count,
                 const GInt64 *arrayStep, const GPtrDiff_t *bufferStride,
@@ -1537,6 +1541,8 @@ class ZarrV3Array final : public ZarrArray
 
 void ZarrClearCoordinateCache();
 void ZarrClearShardIndexCache();
+
+void ZarrReplayErrors(CPLErrorAccumulator &oErrorAccumulator);
 void ZarrEraseShardIndexFromCache(const std::string &osFilename);
 
 #endif  // ZARR_H
