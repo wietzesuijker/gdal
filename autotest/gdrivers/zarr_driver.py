@@ -8561,6 +8561,97 @@ def test_zarr_v3_read_fixed_length_string_dtypes(
     assert ar.Read() == expected_values
 
 
+def test_zarr_v3_resize_preserves_attributes(tmp_path):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    attributes = {
+        "description": "keep",
+        "units": "metre",
+        "scale_factor": 2.0,
+        "add_offset": 3.0,
+        "custom": {"values": [1, 2]},
+    }
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": "uint8",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": 0,
+        "codecs": [{"name": "bytes"}],
+        "attributes": attributes,
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    for size in (4, 5):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Resize([size]) == gdal.CE_None
+            ar = rg = None
+        rewritten = json.loads((filename / "zarr.json").read_text())
+        assert rewritten["attributes"] == attributes
+        assert rewritten["data_type"] == "uint8"
+        assert rewritten["shape"] == [size]
+
+
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize(
+    "type_name,length_bytes,encoding,value,fill_value",
+    [
+        ("null_terminated_bytes", 8, "ascii", "abcdefg", ""),
+        ("fixed_length_utf32", 16, "utf-32-le", "é水😀", ""),
+        ("fixed_length_utf32", 16, "utf-32-le", "é水😀", "f"),
+    ],
+)
+def test_zarr_v3_resize_fixed_length_string_dtype(
+    tmp_path, type_name, length_bytes, encoding, value, fill_value, has_chunk
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    data_type = {"name": type_name, "configuration": {"length_bytes": length_bytes}}
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": fill_value,
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "attributes": {"description": "keep"},
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    chunk = bytes(length_bytes) + value.encode(encoding).ljust(length_bytes, b"\0")
+    if has_chunk:
+        (filename / "c").mkdir()
+        (filename / "c/0").write_bytes(chunk)
+    expected = ["", value] if has_chunk else [fill_value] * 2
+
+    for size in (4, 5):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            assert ar.Resize([size]) == gdal.CE_None
+            ar = rg = None
+
+        rewritten = json.loads((filename / "zarr.json").read_text())
+        assert rewritten["data_type"] == data_type
+        assert rewritten["shape"] == [size]
+        assert rewritten["fill_value"] == fill_value
+        assert rewritten["codecs"] == metadata["codecs"]
+        assert rewritten["attributes"] == metadata["attributes"]
+        if has_chunk:
+            assert (filename / "c/0").read_bytes() == chunk
+        expected += [fill_value] * (size - len(expected))
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            ar = rg = None
+
+
 ###############################################################################
 # Test Zarr v3 sharded fixed-length string array
 
