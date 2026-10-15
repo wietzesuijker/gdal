@@ -8727,6 +8727,220 @@ def test_zarr_write_sharded_read_modify_write(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("existing_shards", [False, True])
+@pytest.mark.parametrize("advise_read", [False, True])
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_zarr_write_sharded_read_same_handle(
+    tmp_path, compress, existing_shards, advise_read, num_threads
+):
+    if compress == "ZSTD" and "zstd" not in gdal.GetDriverByName(
+        "ZARR"
+    ).GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 32), ("x", 32)],
+        [16, 16],
+        [8, 8],
+        gdal.GDT_UInt8,
+        [f"COMPRESS={compress}"],
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    expected = bytearray([3 if existing_shards else 0] * 1024)
+    if existing_shards:
+        assert ar.Write(expected) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            assert ar.Read() == expected
+            for values in (bytes([7] * 49), bytes(range(1, 50)), bytes([11] * 49)):
+                for start in (1, 17):
+                    assert (
+                        ar.Write(values, array_start_idx=[start, start], count=[7, 7])
+                        == gdal.CE_None
+                    )
+                    for y in range(7):
+                        offset = (start + y) * 32 + start
+                        expected[offset : offset + 7] = values[y * 7 : y * 7 + 7]
+                if advise_read:
+                    assert (
+                        ar.AdviseRead(options=[f"NUM_THREADS={num_threads}"])
+                        == gdal.CE_None
+                    )
+                assert ar.Read() == expected
+            ar = None
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("data").Read() == expected
+
+
+@pytest.mark.parametrize("advise_read", [False, True])
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_zarr_write_sharded_read_flush_failure(tmp_path, advise_read, num_threads):
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 8), ("x", 8)],
+        [4, 4],
+        [2, 2],
+        gdal.GDT_UInt8,
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    assert ar.Write(bytes([3] * 64)) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    shard = filename / "data/c/0/0"
+    mode = shard.stat().st_mode
+    with gdal.config_option("GDAL_NUM_THREADS", str(num_threads)):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            try:
+                shard.chmod(0o444)
+                if os.access(shard, os.W_OK):
+                    pytest.skip("cannot make shard read-only")
+                assert (
+                    ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                    == gdal.CE_None
+                )
+                with gdaltest.error_raised(
+                    gdal.CE_Failure, match="Cannot create shard file"
+                ):
+                    if advise_read:
+                        assert (
+                            ar.AdviseRead(options=[f"NUM_THREADS={num_threads}"])
+                            == gdal.CE_Failure
+                        )
+                    else:
+                        assert ar.Read() is None
+            finally:
+                shard.chmod(mode)
+            assert (
+                ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                == gdal.CE_None
+            )
+            expected = bytearray([3] * 64)
+            expected[9] = 7
+            assert ar.Read() == expected
+            ar = None
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("existing_shards", [False, True])
+@pytest.mark.parametrize("num_threads", [None, "2"])
+@pytest.mark.parametrize("step", [2, -1, -2])
+def test_zarr_write_sharded_strided_read_same_handle(
+    tmp_path, compress, existing_shards, num_threads, step
+):
+    if compress == "ZSTD" and "zstd" not in gdal.GetDriverByName(
+        "ZARR"
+    ).GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 8), ("x", 8)],
+        [4, 4],
+        [2, 2],
+        gdal.GDT_UInt8,
+        [f"COMPRESS={compress}"],
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    original = 3 if existing_shards else 0
+    if existing_shards:
+        assert ar.Write(bytes([original] * 64)) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    indices = list(
+        range(0 if step > 0 else 7 if step == -1 else 6, 8 if step > 0 else -1, step)
+    )
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            for value in (7, 9, 11):
+                assert (
+                    ar.Write(bytes([value]), array_start_idx=[2, 2], count=[1, 1])
+                    == gdal.CE_None
+                )
+                expected = bytearray(
+                    value if y == 2 and x == 2 else original
+                    for y in indices
+                    for x in indices
+                )
+                assert (
+                    ar.Read(
+                        array_start_idx=[indices[0]] * 2,
+                        count=[len(indices)] * 2,
+                        array_step=[step] * 2,
+                    )
+                    == expected
+                )
+            ar = None
+
+
+@pytest.mark.parametrize("num_threads", [None, "2"])
+@pytest.mark.parametrize("step", [2, -1, -2])
+def test_zarr_write_sharded_strided_read_flush_failure(tmp_path, num_threads, step):
+    filename = tmp_path / "out.zarr"
+    ds, ar = _create_sharded_array(
+        filename,
+        [("y", 8), ("x", 8)],
+        [4, 4],
+        [2, 2],
+        gdal.GDT_UInt8,
+    )
+    assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+    assert ar.Write(bytes([3] * 64)) == gdal.CE_None
+    ar = None
+    ds.Close()
+
+    shard = filename / "data/c/0/0"
+    mode = shard.stat().st_mode
+    indices = list(
+        range(0 if step > 0 else 7 if step == -1 else 6, 8 if step > 0 else -1, step)
+    )
+    with gdal.config_option("GDAL_NUM_THREADS", num_threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            try:
+                shard.chmod(0o444)
+                if os.access(shard, os.W_OK):
+                    pytest.skip("cannot make shard read-only")
+                assert (
+                    ar.Write(bytes([7]), array_start_idx=[2, 2], count=[1, 1])
+                    == gdal.CE_None
+                )
+                with gdaltest.error_raised(
+                    gdal.CE_Failure, match="Cannot create shard file"
+                ):
+                    assert (
+                        ar.Read(
+                            array_start_idx=[indices[0]] * 2,
+                            count=[len(indices)] * 2,
+                            array_step=[step] * 2,
+                        )
+                        is None
+                    )
+            finally:
+                shard.chmod(mode)
+            assert (
+                ar.Write(bytes([7]), array_start_idx=[2, 2], count=[1, 1])
+                == gdal.CE_None
+            )
+            expected = bytearray([3] * 64)
+            expected[18] = 7
+            assert ar.Read() == expected
+            ar = None
+
+
 def test_zarr_write_sharded_explicit_nodata(tmp_path):
     """Partial write with explicit -9999 nodata."""
     inner_y, inner_x, nodata = 5, 6, -9999.0
