@@ -6018,6 +6018,88 @@ def test_zarr_write_UTM31N_and_EGM96_height(tmp_vsimem):
         assert srs.GetDataAxisToSRSAxisMapping() == [1, 2]
 
 
+@pytest.mark.parametrize("format", ["ZARR_V2", "ZARR_V3"])
+def test_zarr_partial_write_after_reading_missing_chunk(tmp_path, format):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    if format == "ZARR_V2":
+        metadata = {
+            "zarr_format": 2,
+            "shape": [4],
+            "dtype": "|i1",
+            "chunks": [4],
+            "order": "C",
+            "compressor": None,
+            "filters": None,
+            "fill_value": -7,
+        }
+        metadata_filename = ".zarray"
+    else:
+        metadata = {
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [4],
+            "data_type": "int8",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+            "chunk_key_encoding": {"name": "default"},
+            "fill_value": -7,
+            "codecs": [{"name": "bytes"}],
+        }
+        metadata_filename = "zarr.json"
+    (filename / metadata_filename).write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == bytes(array.array("b", [-7] * 4))
+        assert (
+            ar.Write(array.array("b", [11]), array_start_idx=[1], count=[1])
+            == gdal.CE_None
+        )
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == bytes(array.array("b", [-7, 11, -7, -7]))
+
+
+@pytest.mark.parametrize("read_first", [False, True])
+@pytest.mark.parametrize(
+    "data_type,codec",
+    [
+        ("string", "vlen-utf8"),
+        (
+            {"name": "null_terminated_bytes", "configuration": {"length_bytes": 8}},
+            "bytes",
+        ),
+    ],
+)
+def test_zarr_v3_partial_write_missing_string_chunk(
+    tmp_path, data_type, codec, read_first
+):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [4],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": "fill",
+        "codecs": [{"name": codec}],
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        if read_first:
+            assert ar.Read() == ["fill"] * 4
+        assert ar.Write(["new"], array_start_idx=[1], count=[1]) == gdal.CE_None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == ["fill", "new", "fill", "fill"]
+
+
 ###############################################################################
 # Test bug fix for https://github.com/OSGeo/gdal/issues/11016
 
