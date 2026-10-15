@@ -8824,6 +8824,109 @@ def _create_sharded_array(path, dims, shard, inner, dtype=gdal.GDT_Float32, opts
 
 
 @pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("existing_chunks", [False, True])
+@pytest.mark.parametrize("num_threads", [None, 1, 2])
+@pytest.mark.parametrize("followup", ["close", "strided_read", "partial_write"])
+def test_zarr_v3_threaded_write_cache_coherence(
+    tmp_path, compress, sharded, existing_chunks, num_threads, followup
+):
+    if compress == "ZSTD" and "zstd" not in gdal.GetDriverByName(
+        "ZARR"
+    ).GetMetadataItem("COMPRESSORS"):
+        pytest.skip("zstd compressor not available")
+
+    filename = tmp_path / "out.zarr"
+    with gdal.config_option("GDAL_NUM_THREADS", None):
+        ds = gdal.GetDriverByName("ZARR").CreateMultiDimensional(
+            filename, options=["FORMAT=ZARR_V3"]
+        )
+        rg = ds.GetRootGroup()
+        dims = [rg.CreateDimension(name, None, None, 16) for name in ("y", "x")]
+        options = [f"COMPRESS={compress}", "BLOCKSIZE=4,4"]
+        if sharded:
+            options = [f"COMPRESS={compress}", "BLOCKSIZE=8,8", "SHARD_CHUNK_SHAPE=4,4"]
+        ar = rg.CreateMDArray(
+            "data", dims, gdal.ExtendedDataType.Create(gdal.GDT_Byte), options
+        )
+        assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+        if existing_chunks:
+            assert ar.Write(bytes([3] * 256)) == gdal.CE_None
+        ar = rg = None
+        ds.Close()
+
+    threads = None if num_threads is None else str(num_threads)
+    expected = bytearray([9] * 256)
+    with gdal.config_option("GDAL_NUM_THREADS", threads):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            for value, start in ((7, [1, 1]), (8, [5, 5])):
+                assert (
+                    ar.Write(bytes([value]), array_start_idx=start, count=[1, 1])
+                    == gdal.CE_None
+                )
+            assert ar.Write(expected) == gdal.CE_None
+            if followup == "strided_read":
+                assert ar.Read(
+                    array_start_idx=[4, 4], count=[2, 2], array_step=[2, 2]
+                ) == bytes([9] * 4)
+            elif followup == "partial_write":
+                assert (
+                    ar.Write(bytes([6]), array_start_idx=[5, 4], count=[1, 1])
+                    == gdal.CE_None
+                )
+                expected[5 * 16 + 4] = 6
+            ar = None
+
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("data").Read() == expected
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
+def test_zarr_v3_threaded_write_pending_shard_flush_failure(tmp_path, compress):
+    compressors = gdal.GetDriverByName("Zarr").GetMetadataItem("COMPRESSORS")
+    if compress == "ZSTD" and "zstd" not in compressors:
+        pytest.skip("compressor zstd not available")
+    filename = tmp_path / "out.zarr"
+    with gdal.config_option("GDAL_NUM_THREADS", "1"):
+        ds, ar = _create_sharded_array(
+            filename,
+            [("y", 8), ("x", 8)],
+            [4, 4],
+            [2, 2],
+            gdal.GDT_Byte,
+            opts=[f"COMPRESS={compress}"],
+        )
+        assert ar.SetNoDataValueDouble(0) == gdal.CE_None
+        assert ar.Write(bytes([3] * 64)) == gdal.CE_None
+        ar = None
+        ds.Close()
+    shard = filename / "data/c/0/0"
+    mode = shard.stat().st_mode
+    with gdal.config_option("GDAL_NUM_THREADS", "2"):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            ar = ds.GetRootGroup().OpenMDArray("data")
+            assert (
+                ar.Write(bytes([7]), array_start_idx=[1, 1], count=[1, 1])
+                == gdal.CE_None
+            )
+            try:
+                shard.chmod(0o444)
+                if os.access(shard, os.W_OK):
+                    pytest.skip("cannot make shard read-only")
+                with gdaltest.error_raised(
+                    gdal.CE_Failure, match="Cannot create shard file"
+                ):
+                    assert ar.Write(bytes([9] * 64)) == gdal.CE_Failure
+            finally:
+                shard.chmod(mode)
+            assert ar.Write(bytes([9] * 64)) == gdal.CE_None
+            ar = None
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        assert ds.GetRootGroup().OpenMDArray("data").Read() == bytes([9] * 64)
+
+
+@pytest.mark.parametrize("compress", ["NONE", "ZSTD"])
 def test_zarr_write_sharded(tmp_path, compress):
     """Write a sharded Zarr v3 array and verify round-trip."""
     compressors = gdal.GetDriverByName("Zarr").GetMetadataItem("COMPRESSORS")
