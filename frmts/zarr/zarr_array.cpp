@@ -947,12 +947,9 @@ void ZarrArray::DecodeSourceElt(const std::vector<DtypeElt> &elts,
 /*                   ZarrArray::IsAdviseReadCached()                    */
 /************************************************************************/
 
-// Whether the region is covered by the window of the last IAdviseRead()
-// that populated the chunk cache. arrayStep may be null (contiguous region),
-// otherwise its values must be positive.
+// Whether a contiguous region is covered by the last IAdviseRead().
 bool ZarrArray::IsAdviseReadCached(const GUInt64 *arrayStartIdx,
-                                   const size_t *count,
-                                   const GInt64 *arrayStep) const
+                                   const size_t *count) const
 {
     const size_t nDims = m_aoDims.size();
     if (!m_bValid || m_oChunkCache.empty() ||
@@ -960,10 +957,7 @@ bool ZarrArray::IsAdviseReadCached(const GUInt64 *arrayStartIdx,
         return false;
     for (size_t i = 0; i < nDims; ++i)
     {
-        const GUInt64 reqEnd =
-            arrayStartIdx[i] +
-            (count[i] - 1) *
-                (arrayStep ? static_cast<uint64_t>(arrayStep[i]) : 1);
+        const GUInt64 reqEnd = arrayStartIdx[i] + count[i] - 1;
         const GUInt64 cachedEnd =
             m_anCachedAdviseReadStart[i] + m_anCachedAdviseReadCount[i] - 1;
         if (arrayStartIdx[i] < m_anCachedAdviseReadStart[i] ||
@@ -1227,7 +1221,7 @@ bool ZarrArray::IRead(const GUInt64 *arrayStartIdx, const size_t *count,
     if (nDims >= 2 && std::all_of(arrayStep, arrayStep + nDims,
                                   [](GInt64 nStep) { return nStep == 1; }))
     {
-        if (!IsAdviseReadCached(arrayStartIdx, count, arrayStep))
+        if (!IsAdviseReadCached(arrayStartIdx, count))
         {
             const char *pszNumThreads =
                 CPLGetConfigOption("GDAL_NUM_THREADS", nullptr);

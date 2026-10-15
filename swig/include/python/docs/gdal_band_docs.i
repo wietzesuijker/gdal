@@ -8,30 +8,19 @@ Python proxy of a :cpp:class:`GDALRasterBand`.
 
 %feature("docstring")  AdviseRead "
 
-Advise driver of upcoming read requests.
-
-See :cpp:func:`GDALRasterBand::AdviseRead`.
+Advise upcoming reads. See :cpp:func:`GDALRasterBand::AdviseRead`.
 
 Parameters
 ----------
-xoff : int
-    The pixel offset to the left side of the region of interest.
-yoff : int
-    The line offset to the top side of the region of interest.
-xsize : int
-    The width of the region of interest, in pixels.
-ysize : int
-    The height of the region of interest, in lines.
-buf_xsize : int, optional
-    The width of the buffer the region will later be read into. By default,
-    equal to ``xsize``. A smaller value advises a downsampled
-    (e.g. overview-sized) read.
-buf_ysize : int, optional
-    The height of the buffer the region will later be read into. By default,
-    equal to ``ysize``.
+xoff, yoff : int
+    Pixel and line offsets of the source window.
+xsize, ysize : int
+    Width and height of the source window.
+buf_xsize, buf_ysize : int, optional
+    Future buffer dimensions, defaulting to ``xsize`` and ``ysize``.
+    Smaller dimensions advise a downsampled read.
 buf_type : int, optional
-    The data type (one of the ``GDT_*`` constants) of the buffer. By default,
-    the data type of the band.
+    Buffer ``GDT_*`` type, defaulting to the band's type.
 options : dict or list, optional
     Driver-specific options.
 

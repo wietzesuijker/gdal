@@ -770,7 +770,7 @@ bool ZarrV2Array::IAdviseRead(const GUInt64 *arrayStartIdx, const size_t *count,
     // The chunk cache already holds the requested region, for example when
     // GDALRasterBandFromArray::IRasterIO() advises a window of a previous
     // AdviseRead() on the whole raster
-    if (IsAdviseReadCached(arrayStartIdx, count, nullptr))
+    if (IsAdviseReadCached(arrayStartIdx, count))
         return true;
 
     std::vector<uint64_t> anIndicesCur;
