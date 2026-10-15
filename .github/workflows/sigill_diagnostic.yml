@@ -1,0 +1,61 @@
+name: Ubuntu 20 SIGILL diagnostic
+
+on:
+  push:
+    branches:
+      - 'test/s8-ubuntu20-sigill-diagnostic-20261015'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sigill-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-comparison:
+    if: github.repository == 'wietzesuijker/gdal'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout diagnostic harness and exact source revisions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore the original master cache without a fallback or save
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ubuntu_20.04-znver3-master-9c9d722b8090ede7a17a142076662833c5d2802b
+
+      - name: Compare native tests in one container
+        id: probe
+        timeout-minutes: 110
+        env:
+          SIGILL_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          SIGILL_CACHE_MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+        run: bash .github/workflows/sigill_diagnostic/run.sh
+
+      - name: Finalize the evidence manifest after every outcome
+        if: always()
+        env:
+          SIGILL_WORKFLOW_OUTCOME: ${{ steps.probe.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sigill-diagnostic/artifacts"
+          docker rm --force "sigill-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/sigill-diagnostic/artifacts/final-container-cleanup.log" 2>&1 || true
+          python3 .github/workflows/sigill_diagnostic/probe.py \
+            --manifest "$RUNNER_TEMP/sigill-diagnostic/artifacts" \
+            --workflow-outcome "$SIGILL_WORKFLOW_OUTCOME"
+
+      - name: Retain evidence, including failed and incomplete phases
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ubuntu20-sigill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sigill-diagnostic/artifacts
+          if-no-files-found: error
+          retention-days: 14

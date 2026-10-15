@@ -6,6 +6,7 @@ on:
             - 'doc/**'
             - 'docker/**'
         branches-ignore:
+            - 'test/s8-ubuntu20-sigill-diagnostic-20261015'
             - 'backport**'
             - 'dependabot**'
 
