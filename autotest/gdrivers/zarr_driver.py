@@ -6382,7 +6382,9 @@ def test_zarr_v3_partial_write_missing_string_chunk(
         "data_type": data_type,
         "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
         "chunk_key_encoding": {"name": "default"},
-        "fill_value": "fill",
+        "fill_value": (
+            base64.b64encode(b"fill").decode("ascii") if codec == "bytes" else "fill"
+        ),
         "codecs": [{"name": codec}],
     }
     (filename / "zarr.json").write_text(json.dumps(metadata))
@@ -8650,6 +8652,135 @@ def test_zarr_v3_resize_fixed_length_string_dtype(
             ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
             assert ar.Read() == expected
             ar = rg = None
+
+
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize(
+    "type_name,fill_value",
+    [
+        ("null_terminated_bytes", ""),
+        ("null_terminated_bytes", "f"),
+        ("null_terminated_bytes", "Zg=="),
+        ("null_terminated_bytes", "é"),
+        ("fixed_length_utf32", "f"),
+        ("string", "Zg=="),
+    ],
+)
+def test_zarr_v3_string_fill_roundtrip(tmp_path, type_name, fill_value, has_chunk):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    if type_name == "string":
+        data_type = type_name
+        codecs = [{"name": "vlen-utf8"}]
+        chunk = struct.pack("<III", 2, 0, 3) + b"abc"
+    else:
+        length_bytes = 8 if type_name == "null_terminated_bytes" else 16
+        data_type = {"name": type_name, "configuration": {"length_bytes": length_bytes}}
+        codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+        encoding = "ascii" if type_name == "null_terminated_bytes" else "utf-32-le"
+        chunk = bytes(length_bytes) + "abc".encode(encoding).ljust(length_bytes, b"\0")
+    encoded_fill = (
+        base64.b64encode(fill_value.encode("utf-8")).decode("ascii")
+        if type_name == "null_terminated_bytes"
+        else fill_value
+    )
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": encoded_fill,
+        "codecs": codecs,
+        "attributes": {"description": "keep"},
+    }
+    (filename / "zarr.json").write_text(json.dumps(metadata))
+    if has_chunk:
+        (filename / "c").mkdir()
+        (filename / "c/0").write_bytes(chunk)
+    expected = ["", "abc"] if has_chunk else [fill_value] * 2
+    for size in (4, 5):
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            assert ar.Resize([size]) == gdal.CE_None
+            ar = rg = None
+        expected += [fill_value] * (size - len(expected))
+        rewritten = json.loads((filename / "zarr.json").read_text())
+        for key in ("data_type", "fill_value", "codecs", "attributes"):
+            assert rewritten[key] == metadata[key]
+        if has_chunk:
+            assert (filename / "c/0").read_bytes() == chunk
+
+    if has_chunk:
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Write(["X"], array_start_idx=[0], count=[1]) == gdal.CE_None
+            ar = rg = None
+        expected[0] = "X"
+    with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+        rg = ds.GetRootGroup()
+        ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert ar.Read() == expected
+        ar = rg = None
+
+
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize("native_fill", [b"a\0b", b"\0a", b"a\0", b"\0"])
+@gdaltest.enable_exceptions()
+def test_zarr_v3_s8_fill_null_bytes(tmp_path, native_fill, has_chunk):
+    filename = tmp_path / "test.zarr"
+    filename.mkdir()
+    data_type = {"name": "null_terminated_bytes", "configuration": {"length_bytes": 8}}
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2],
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}},
+        "chunk_key_encoding": {"name": "default"},
+        "fill_value": base64.b64encode(native_fill).decode("ascii"),
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "attributes": {"description": "keep"},
+    }
+    original = json.dumps(metadata).encode("ascii")
+    (filename / "zarr.json").write_bytes(original)
+    chunk = bytes(8) + b"abc".ljust(8, b"\0")
+    if has_chunk:
+        (filename / "c").mkdir()
+        (filename / "c/0").write_bytes(chunk)
+    unpadded = native_fill.rstrip(b"\0")
+    if b"\0" in unpadded:
+        with pytest.raises(Exception, match="embedded NUL bytes.*fill_value"):
+            with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+                rg = ds.GetRootGroup()
+                rg.OpenMDArray(rg.GetMDArrayNames()[0])
+        assert (filename / "zarr.json").read_bytes() == original
+    else:
+        fill = unpadded.decode("ascii")
+        expected = ["", "abc"] if has_chunk else [fill] * 2
+        for size in (3, 5):
+            with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER | gdal.OF_UPDATE) as ds:
+                rg = ds.GetRootGroup()
+                ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+                assert ar.Read() == expected
+                assert ar.Resize([size]) == gdal.CE_None
+                ar = rg = None
+            expected += [fill] * (size - len(expected))
+            rewritten = json.loads((filename / "zarr.json").read_text())
+            assert rewritten["fill_value"] == base64.b64encode(unpadded).decode("ascii")
+            assert rewritten["data_type"] == data_type
+            assert rewritten["attributes"] == metadata["attributes"]
+        with gdal.OpenEx(filename, gdal.OF_MULTIDIM_RASTER) as ds:
+            rg = ds.GetRootGroup()
+            ar = rg.OpenMDArray(rg.GetMDArrayNames()[0])
+            assert ar.Read() == expected
+            ar = rg = None
+    if has_chunk:
+        assert (filename / "c/0").read_bytes() == chunk
 
 
 ###############################################################################
